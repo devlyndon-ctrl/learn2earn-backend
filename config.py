@@ -1,0 +1,4 @@
+# config.py
+SUPABASE_URL = 'https://myetrhrskmbwnmmmxdzt.supabase.co'
+SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im15ZXRyaHJza21id25tbW14ZHp0Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2ODI4NjUzMCwiZXhwIjoyMDgzODYyNTMwfQ.bkRkGO9kdx4LZtDTQ_rbjrHzzAs3yd9lJL5zwumHX_8'
+SECRET_KEY = 'secretlang'
