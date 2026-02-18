@@ -1,1 +1,13 @@
+Flask
+flask-cors
+supabase
+python-dotenv
+flask-mail
+requests
+nltk
+pytz
+python-dateutil
+langdetect
+openpyxl
+pandas
 gunicorn
