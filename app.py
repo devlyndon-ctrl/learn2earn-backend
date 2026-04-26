@@ -9,18 +9,56 @@ import random
 import string
 import time
 import requests
-from dateutil import parser
 import pytz
 from pytz import timezone, UTC
-from nltk.sentiment import SentimentIntensityAnalyzer
 from langdetect import detect, LangDetectException
-import nltk
-from nltk.corpus import words
 import re
 from werkzeug.utils import secure_filename
 import mimetypes
-from datetime import datetime
-from pytz import timezone
+from uuid import uuid4
+import traceback
+import logging
+import tempfile
+import os
+import secrets
+import PyPDF2
+from docx import Document
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Lazy-load NLTK components to avoid blocking on startup
+_sentiment_analyzer = None
+_stopwords = None
+_nltk_words = None
+
+
+# === NLP TO PANG SALA ===
+def get_sentiment_analyzer():
+    global _sentiment_analyzer
+    if _sentiment_analyzer is None:
+        from nltk.sentiment import SentimentIntensityAnalyzer
+        _sentiment_analyzer = SentimentIntensityAnalyzer()
+    return _sentiment_analyzer
+
+def get_stopwords():
+    global _stopwords
+    if _stopwords is None:
+        from nltk.corpus import stopwords
+        _stopwords = set(stopwords.words('english'))
+    return _stopwords
+
+def get_nltk_words():
+    global _nltk_words
+    if _nltk_words is None:
+        from nltk.corpus import words
+        _nltk_words = set(words.words())
+    return _nltk_words
+
+def sent_tokenize(text):
+    from nltk.tokenize import sent_tokenize as _sent_tokenize
+    return _sent_tokenize(text)
 
 
 
@@ -29,8 +67,22 @@ app = Flask(__name__)
 CORS(app)
 app.secret_key = config.SECRET_KEY  # Needed for session management
 
-# Initialize Supabase client
-supabase = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+# Lazy-load Supabase client to avoid blocking on startup
+_supabase_client = None
+
+def get_supabase():
+    """Lazy-load Supabase client on first use"""
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+    return _supabase_client
+
+# Create a proxy for backward compatibility
+class SupabaseProxy:
+    def __getattr__(self, name):
+        return getattr(get_supabase(), name)
+
+supabase = SupabaseProxy()
 
 def format_date(dt_str):
     if not dt_str or str(dt_str).lower() == 'none':
@@ -57,12 +109,20 @@ mail = Mail(app)
 pending_registrations = {}
 otp_store = {}
 
+
+
 UPLOAD_FOLDER = 'uploads/profile_pics'
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'pdf', 'docx', 'txt'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 
-# --- LOGIN ROUTE ---
+
+# ====================================================================================================
+#                                         USER AUTHENTICATION START
+# ====================================================================================================
+
+
+# === LOGIN ===
 @app.route('/login', methods=['POST'])
 def login():
     """
@@ -221,9 +281,7 @@ def login():
         return jsonify({'error': str(e)}), 500
 
 
-
-
-# --- FORGOT PASSWORD ROUTE ---
+# === FORGET PASSWORD ROUTE ===
 @app.route('/forgot_password', methods=['POST'])
 def forgot_password():
     data = request.get_json()
@@ -246,7 +304,7 @@ def forgot_password():
     return jsonify({'message': 'OTP sent to email'}), 200
 
 
-# --- FORGOT PASS VERIFY MUNA NG OTP ROUTE ---
+# === FORGOT PASS VERIFY MUNA NG OTP ROUTE ===
 @app.route('/verify_forgot_otp', methods=['POST'])
 def verify_forgot_otp():
     data = request.get_json()
@@ -268,7 +326,7 @@ def verify_forgot_otp():
         return jsonify({'success': False, 'error': 'Invalid OTP'}), 400
 
 
-# --- RESET PASSWORD & ENTER NEW PASS ROUTE ---
+# === RESET PASSWORD & ENTER NEW PASS ROUTE ===
 @app.route('/reset_password', methods=['POST'])
 def reset_password():
     data = request.get_json()
@@ -309,8 +367,7 @@ def reset_password():
     return jsonify({'success': True, 'message': 'Password reset successful'}), 200
 
 
-
-# --- Helper: Send OTP Email ---
+# === EMAIL OTP HELPER FUNCTION === 
 def send_otp_email(recipient, otp, for_reset=False):
     if for_reset:
         msg = Message("Learn2Earn Password Reset", sender="Learn2Earn", recipients=[recipient])
@@ -348,7 +405,7 @@ Learn2Earn Team
 
 
 
-# --- Registration Route (Step 1: Send OTP, Don't Insert Yet) ---
+# === Registration Route (Step 1: Send OTP, Don't Insert Yet) ===
 @app.route('/register', methods=['POST'])
 def register():
     """
@@ -392,7 +449,7 @@ def register():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-
+# === Check Mobile Number Route ===
 @app.route('/check_mobile', methods=['POST'])
 def check_mobile():
     data = request.get_json()
@@ -403,7 +460,8 @@ def check_mobile():
     exists = bool(resp.data and len(resp.data) > 0)
     return jsonify({'exists': exists}), 200
 
-# --- Verify OTP and Complete Registration Route ---
+
+# === Verify OTP and Complete Registration Route ===
 @app.route('/api/verify_otp', methods=['POST'])
 def verify_otp():
     data = request.get_json()
@@ -454,45 +512,18 @@ def verify_otp():
 
 
 
-# --- NLP NOTIFICATIONS DISLAY ROUTE ---
-@app.route('/student_nlp_notifications', methods=['GET'])
-def students_nlp_notifications():
-    student_id = request.args.get('user_id')
-    if not student_id:
-        print("[DEBUG] No student_id provided")
-        return jsonify({'success': False, 'notifications': []})
-    try:
-        result = supabase.table('nlp_notifications') \
-            .select('*') \
-            .eq('student_id', student_id) \
-            .eq('status', 'Unread') \
-            .order('created_at', desc=True) \
-            .limit(5) \
-            .execute()
-        notifications = result.data if result.data else []
-        print(f"[DEBUG] NLP notifications for student_id={student_id}: {notifications}")
-        return jsonify({'success': True, 'notifications': notifications})
-    except Exception as e:
-        print(f"[DEBUG] Error fetching NLP notifications: {e}")
-        return jsonify({'success': False, 'notifications': []})
+# ====================================================================================================
+#                                         USER AUTHENTICATION END
+# ====================================================================================================
 
-# --- MARK NLP NOTIFICATION AS READ ROUTE ---
-@app.route('/mark_student_nlp_notifications/<int:notif_id>/read', methods=['POST'])
-def mark_student_nlp_notification_read(notif_id):
-    try:
-        safe_execute(
-            supabase.table('nlp_notifications')
-            .update({'status': 'Read'})
-            .eq('id', notif_id)
-        )
-        return jsonify({'success': True})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+
+# ====================================================================================================
+#                                         STUDENT DASHBOARD PAGE START
+# ====================================================================================================
 
 
 
-
-# --- DASHBOARD USER INFO ROUTE ---
+# --- STUDENT DASHBOARD INFO ROUTE ---
 @app.route('/dashboard', methods=['GET'])
 def get_current_user_info():
     from dateutil import parser
@@ -824,7 +855,6 @@ def get_current_user_info():
 
 
 
-
 # --- ACHIEVEMENTS PAGE ROUTE ---
 @app.route('/achievements', methods=['GET'])
 def get_achievements():
@@ -1026,7 +1056,7 @@ def get_achievements():
     return jsonify({'success': True, 'achievements': all_achievements}), 200
 
 
-# --- CLAIM MILESTONE ROUTE ---
+# --- CLAIM MILESTONE SECTION ROUTE ---
 @app.route('/claim_milestone', methods=['POST'])
 def claim_milestone():
     data = request.get_json()
@@ -1152,7 +1182,58 @@ def claim_milestone():
 
 
 
-# --- GET TASKS ROUTE ---
+# --- NLP NOTIFICATIONS DISLAY ROUTE ---
+@app.route('/student_nlp_notifications', methods=['GET'])
+def students_nlp_notifications():
+    student_id = request.args.get('user_id')
+    if not student_id:
+        print("[DEBUG] No student_id provided")
+        return jsonify({'success': False, 'notifications': []})
+    try:
+        result = supabase.table('nlp_notifications') \
+            .select('*') \
+            .eq('student_id', student_id) \
+            .eq('status', 'Unread') \
+            .order('created_at', desc=True) \
+            .limit(5) \
+            .execute()
+        notifications = result.data if result.data else []
+        print(f"[DEBUG] NLP notifications for student_id={student_id}: {notifications}")
+        return jsonify({'success': True, 'notifications': notifications})
+    except Exception as e:
+        print(f"[DEBUG] Error fetching NLP notifications: {e}")
+        return jsonify({'success': False, 'notifications': []})
+
+# --- MARK NLP NOTIFICATION AS READ ROUTE ---
+@app.route('/mark_student_nlp_notifications/<int:notif_id>/read', methods=['POST'])
+def mark_student_nlp_notification_read(notif_id):
+    try:
+        safe_execute(
+            supabase.table('nlp_notifications')
+            .update({'status': 'Read'})
+            .eq('id', notif_id)
+        )
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+
+# ====================================================================================================
+#                                         STUDENT DASHBOARD PAGE END
+# ====================================================================================================
+
+
+
+
+# ====================================================================================================
+#                                         STUDENT ACTIVITIES PAGE START
+# ====================================================================================================
+
+
+
+
+# --- GET ACTIVITIES AND QUIZ DISPLAY PAGE ROUTE ---
 @app.route('/tasks', methods=['GET'])
 def get_tasks():
     user_id = request.args.get('user_id')
@@ -1161,22 +1242,28 @@ def get_tasks():
 
     # Fetch user's all-time points
     user_resp = safe_execute(
-        supabase.table('user_info').select('total_points').eq('id', user_id)
+        supabase.table('user_info').select('total_points', 'year_level', 'section').eq('id', user_id)
     )
     if not user_resp.data or len(user_resp.data) == 0:
         return jsonify({'error': 'User not found'}), 404
 
     all_time_points = user_resp.data[0].get('total_points', 0)
+    year_level = user_resp.data[0].get('year_level', '')
+    section = user_resp.data[0].get('section', '')
 
-    # Fetch tasks for this student
+    # Fetch tasks for this student, including links and attachments
     tasks_resp = safe_execute(
         supabase.table('task_assignments')
-        .select('*')
-        .eq('student_id', user_id)  # <-- FIXED: use student_id
+        .select('task_id, task, points, description, due_date, priority, status, image_urls, attachments, links, teacher_id, grade_level, section, submitted_at')
+        .eq('student_id', user_id)
     )
     tasks = tasks_resp.data if tasks_resp and hasattr(tasks_resp, 'data') else []
 
-    # After fetching tasks
+    # --- DEBUG: Print attachments for each task ---
+    for t in tasks:
+        print(f"[DEBUG] TaskID {t.get('task_id')}: attachments = {t.get('attachments')}")
+
+    # Attach teacher info to each task
     teacher_ids = list({t.get('teacher_id') for t in tasks if t.get('teacher_id')})
     teacher_map = {}
     if teacher_ids:
@@ -1200,7 +1287,6 @@ def get_tasks():
             if p['user_id'] in teacher_map:
                 teacher_map[p['user_id']]['profile_picture'] = p['file_path']
 
-    # Attach teacher info to each task
     for t in tasks:
         tid = t.get('teacher_id')
         if tid and tid in teacher_map:
@@ -1213,52 +1299,268 @@ def get_tasks():
         supabase.table('points')
         .select('*')
         .eq('student_id', user_id)
-        .order('received_at', desc=True)  # <-- Add this
+        .order('received_at', desc=True)
     )
     awarded_points = points_resp.data if points_resp and hasattr(points_resp, 'data') else []
 
-    # After collecting teacher_ids from awarded_points
-    teacher_ids = list({p.get('teacher_id') for p in awarded_points if p.get('teacher_id')})
-    teacher_map = {}
-    if teacher_ids:
-        # Get teacher names and subject
+    # Attach teacher info to each awarded point
+    teacher_ids_points = list({p.get('teacher_id') for p in awarded_points if p.get('teacher_id')})
+    teacher_map_points = {}
+    if teacher_ids_points:
         teacher_resp = safe_execute(
             supabase.table('user_info')
             .select('id, first_name, last_name, subject')
-            .in_('id', teacher_ids)
+            .in_('id', teacher_ids_points)
         )
         for t in teacher_resp.data:
-            teacher_map[t['id']] = {
+            teacher_map_points[t['id']] = {
                 'name': f"{t.get('first_name', '')} {t.get('last_name', '')}".strip(),
                 'subject': t.get('subject', '')
             }
-        # Get teacher profile pictures
         pic_resp = safe_execute(
             supabase.table('profile_pictures')
             .select('user_id, file_path')
-            .in_('user_id', teacher_ids)
+            .in_('user_id', teacher_ids_points)
         )
         for p in pic_resp.data:
-            if p['user_id'] in teacher_map:
-                teacher_map[p['user_id']]['profile_picture'] = p['file_path']
+            if p['user_id'] in teacher_map_points:
+                teacher_map_points[p['user_id']]['profile_picture'] = p['file_path']
 
-    # Attach teacher info to each awarded point
     for p in awarded_points:
         tid = p.get('teacher_id')
-        if tid and tid in teacher_map:
-            p['teacher_name'] = teacher_map[tid]['name']
-            p['teacher_subject'] = teacher_map[tid].get('subject', '')
-            p['teacher_profile_picture'] = teacher_map[tid].get('profile_picture', '')
+        if tid and tid in teacher_map_points:
+            p['teacher_name'] = teacher_map_points[tid]['name']
+            p['teacher_subject'] = teacher_map_points[tid].get('subject', '')
+            p['teacher_profile_picture'] = teacher_map_points[tid].get('profile_picture', '')
 
-    # Return tasks, awarded points, and all-time points
-    return jsonify({
+    # --- NEW: Get all teachers assigned to this section and grade level ---
+    teacher_assignments_resp = safe_execute(
+        supabase.table('teacher_class_assignments')
+        .select('teacher_id')
+        .eq('section', section)
+        .eq('grade_level', year_level)
+    )
+    teacher_ids_assigned = [t['teacher_id'] for t in teacher_assignments_resp.data] if teacher_assignments_resp.data else []
+
+    teachers = []
+    if teacher_ids_assigned:
+        user_resp = safe_execute(
+            supabase.table('user_info')
+            .select('id, first_name, last_name, subject')
+            .in_('id', teacher_ids_assigned)
+        )
+        for t in user_resp.data if user_resp.data else []:
+            pic_resp = safe_execute(
+                supabase.table('profile_pictures')
+                .select('file_path')
+                .eq('user_id', t['id'])
+                .order('uploaded_at', desc=True)
+                .limit(1)
+            )
+            profile_picture = pic_resp.data[0]['file_path'] if pic_resp.data else ''
+            teachers.append({
+                'id': t['id'],
+                'first_name': t.get('first_name', ''),
+                'last_name': t.get('last_name', ''),
+                'subject': t.get('subject', ''),
+                'profile_picture': profile_picture,
+            })
+
+    
+    quizzes = []
+    quiz_dict = {}  # Track by ID to avoid duplicates
+    try:
+        print(f"[QUIZ] Attempting to fetch teacher_quizzes for student {user_id}...")
+        print(f"[QUIZ] Student info - Grade: {year_level}, Section: {section}")
+        
+        # ✅ STEP 1: Fetch quizzes already taken by this student (COMPLETED)
+        print(f"[QUIZ] STEP 1: Fetching completed quizzes from student_quiz_results...")
+        try:
+            completed_quizzes_resp = safe_execute(
+                supabase.table('student_quiz_results')
+                .select('teacher_quiz_id, score, submitted_date')
+                .eq('student_id', int(user_id))
+            )
+            completed_quiz_map = {}
+            completed_quiz_ids = set()
+            if completed_quizzes_resp and completed_quizzes_resp.data:
+                for result in completed_quizzes_resp.data:
+                    quiz_id_int = int(result['teacher_quiz_id']) if isinstance(result['teacher_quiz_id'], (str, int)) else result['teacher_quiz_id']
+                    score_value = result.get('score')
+                    # ✅ CONVERT SCORE TO INT IF NEEDED
+                    if score_value is not None:
+                        score_value = int(score_value) if isinstance(score_value, str) else score_value
+                    
+                    completed_quiz_map[quiz_id_int] = {
+                        'score': score_value,
+                        'submitted_date': result.get('submitted_date')
+                    }
+                    completed_quiz_ids.add(quiz_id_int)
+                    print(f"[QUIZ] ✓ Completed Quiz ID: {quiz_id_int}, Score: {score_value}, Type: {type(score_value)}, Is None: {score_value is None}")
+            print(f"[QUIZ] Student has completed {len(completed_quiz_ids)} quizzes with scores: {completed_quiz_map}")
+            print(f"[QUIZ] DEBUG - completed_quiz_map contents: {json.dumps({str(k): v for k, v in completed_quiz_map.items()}, default=str)}")
+        except Exception as e:
+            print(f"[QUIZ] ❌ ERROR fetching completed quizzes: {e}")
+            import traceback
+            print(f"[QUIZ] Traceback: {traceback.format_exc()}")
+            completed_quiz_map = {}
+            completed_quiz_ids = set()
+        
+        # ✅ STEP 2: Fetch quiz details for completed quizzes (even if not currently assigned)
+        print(f"[QUIZ] STEP 2: Fetching details for completed quiz IDs: {completed_quiz_ids}")
+        if completed_quiz_ids:
+            try:
+                completed_quizzes_details_resp = safe_execute(
+                    supabase.table('teacher_quizzes')
+                    .select('*')
+                    .in_('id', list(completed_quiz_ids))
+                )
+                if completed_quizzes_details_resp and completed_quizzes_details_resp.data:
+                    print(f"[QUIZ] Found {len(completed_quizzes_details_resp.data)} quiz details for completed quizzes")
+                    for row_data in completed_quizzes_details_resp.data:
+                        quiz_id_int = row_data.get('id')
+                        if isinstance(quiz_id_int, str):
+                            quiz_id_int = int(quiz_id_int)
+                        
+                        quiz = {
+                            'id': quiz_id_int,
+                            'quiz_title': row_data.get('quiz_title'),
+                            'instructions': row_data.get('instructions'),
+                            'teacher_id': row_data.get('teacher_id'),
+                            'due_date': row_data.get('due_date'),
+                            'total_items': row_data.get('total_items'),
+                            'points_per_item': row_data.get('points_per_item'),
+                            'total_points': row_data.get('total_points'),
+                            'time_limit_minutes': row_data.get('time_limit_minutes'),
+                            'topic': row_data.get('topic'),
+                            'quarter': row_data.get('quarter'),
+                            'quiz_data': row_data.get('quiz_data'),
+                            'grade_level': row_data.get('grade_level'),
+                            'section': row_data.get('section'),
+                            'created_at': row_data.get('created_at'),
+                            'updated_at': row_data.get('updated_at'),
+                            'status': 'completed',  # Mark as completed
+                            'score': completed_quiz_map[quiz_id_int]['score'],  # ✅ INCLUDE ACTUAL SCORE
+                            'submitted_date': completed_quiz_map[quiz_id_int]['submitted_date']  # ✅ INCLUDE SUBMITTED DATE
+                        }
+                        quiz_dict[quiz_id_int] = quiz
+                        actual_score = completed_quiz_map[quiz_id_int]['score']
+                        print(f"[QUIZ_BUILD] ✓ Step 2: Built completed quiz: ID {quiz_id_int}")
+                        print(f"[QUIZ_BUILD]   - Title: {quiz.get('quiz_title')}")
+                        print(f"[QUIZ_BUILD]   - Score from map: {actual_score} (Type: {type(actual_score)})")
+                        print(f"[QUIZ_BUILD]   - Score in quiz obj: {quiz['score']} (Type: {type(quiz['score'])})")
+                        print(f"[QUIZ_BUILD]   - Total items: {quiz.get('total_items')}")
+                        print(f"[QUIZ_BUILD]   - Total points: {quiz.get('total_points')}")
+            except Exception as e:
+                print(f"[QUIZ] Warning: Could not fetch completed quiz details: {e}")
+                import traceback
+                print(f"[QUIZ] Traceback: {traceback.format_exc()}")
+        
+        # ✅ STEP 3: Fetch assigned quizzes (for this grade/section)
+        print(f"[QUIZ] STEP 3: Fetching assigned quizzes for grade {year_level}, section {section}...")
+        quizzes_resp = safe_execute(
+            supabase.table('teacher_quizzes')
+            .select('*')
+            .eq('grade_level', year_level)
+            .eq('section', section)
+        )
+        
+        if quizzes_resp and hasattr(quizzes_resp, 'data') and quizzes_resp.data:
+            print(f"[QUIZ] Found {len(quizzes_resp.data)} assigned quizzes for this grade/section")
+            for row_data in quizzes_resp.data:
+                quiz_id_int = row_data.get('id')
+                if isinstance(quiz_id_int, str):
+                    quiz_id_int = int(quiz_id_int)
+                
+                # Skip if already added from completed quizzes
+                if quiz_id_int in quiz_dict:
+                    print(f"[QUIZ] Skipping {quiz_id_int} (already in completed quizzes)")
+                    continue
+                
+                quiz = {
+                    'id': quiz_id_int,
+                    'quiz_title': row_data.get('quiz_title'),
+                    'instructions': row_data.get('instructions'),
+                    'teacher_id': row_data.get('teacher_id'),
+                    'due_date': row_data.get('due_date'),
+                    'total_items': row_data.get('total_items'),
+                    'points_per_item': row_data.get('points_per_item'),
+                    'total_points': row_data.get('total_points'),
+                    'time_limit_minutes': row_data.get('time_limit_minutes'),
+                    'topic': row_data.get('topic'),
+                    'quarter': row_data.get('quarter'),
+                    'quiz_data': row_data.get('quiz_data'),
+                    'grade_level': row_data.get('grade_level'),
+                    'section': row_data.get('section'),
+                    'created_at': row_data.get('created_at'),
+                    'updated_at': row_data.get('updated_at'),
+                }
+                
+                # Check if completed
+                if quiz_id_int in completed_quiz_map:
+                    quiz['status'] = 'completed'
+                    quiz['score'] = completed_quiz_map[quiz_id_int]['score']  # ✅ ADD SCORE
+                    quiz['submitted_date'] = completed_quiz_map[quiz_id_int]['submitted_date']  # ✅ ADD SUBMITTED DATE
+                    retrieved_score = quiz['score']
+                    print(f"[QUIZ] ✓ COMPLETED (from assigned list): {quiz.get('quiz_title')} (ID: {quiz_id_int}, Score from DB: {retrieved_score})")
+                else:
+                    quiz['status'] = 'assigned'
+                    # ✅ DO NOT ADD SCORE FOR NON-COMPLETED QUIZZES
+                    print(f"[QUIZ] ✓ ASSIGNED (not completed): {quiz.get('quiz_title')} (ID: {quiz_id_int})")
+                
+                quiz_dict[quiz_id_int] = quiz
+        else:
+            print(f"[QUIZ] No assigned quizzes found for grade {year_level} section {section}")
+        
+        # ✅ STEP 4: Attach teacher info to all quizzes
+        print(f"[QUIZ] STEP 4: Attaching teacher info to {len(quiz_dict)} quizzes...")
+        for quiz_id_int, quiz in quiz_dict.items():
+            teacher_id = quiz.get('teacher_id')
+            if teacher_id and teacher_id in teacher_map:
+                quiz['teacher_name'] = teacher_map[teacher_id]['name']
+                quiz['teacher_subject'] = teacher_map[teacher_id].get('subject', '')
+        
+        # Convert dict to list
+        quizzes = list(quiz_dict.values())
+        print(f"[QUIZ] Successfully loaded {len(quizzes)} total quizzes (assigned + completed)")
+        
+        # ✅ DEBUG: Log all quizzes being returned
+        print(f"[QUIZ_RESPONSE_BATCH] Returning {len(quizzes)} quizzes:")
+        for quiz in quizzes:
+            score = quiz.get('score')
+            status = quiz.get('status')
+            title = quiz.get('quiz_title')
+            quiz_id = quiz.get('id')
+            total_items = quiz.get('total_items')
+            total_points = quiz.get('total_points')
+            print(f"  [FINAL] ID: {quiz_id} | Title: {title} | Status: {status} | Score: {score} | TotalItems: {total_items} | TotalPoints: {total_points}")
+        
+        # ✅ VERIFY JSON SERIALIZATION
+        print(f"[JSON_CHECK] Sample quiz from response (if any completed):")
+        for quiz in quizzes:
+            if quiz.get('status') == 'completed':
+                print(f"[JSON_SAMPLE] {json.dumps(quiz, indent=2)[:500]}...")
+                break
+        
+    except Exception as e:
+        print(f"[QUIZ] ERROR fetching quizzes: {e}")
+        import traceback
+        print(f"[QUIZ] Traceback: {traceback.format_exc()}")
+        quizzes = []
+
+    # Return tasks, awarded points, all-time points, assigned teachers, and quizzes
+    response_data = {
         'tasks': tasks,
+        'quizzes': quizzes,
         'awarded_points': awarded_points,
         'total_points': sum([t.get('points', 0) for t in tasks if t.get('status', '').lower() in ['assigned', 'pending']]),
-        'all_time_points': all_time_points
-    })
-
-
+        'all_time_points': all_time_points,
+        'teachers': teachers,  # <-- Assigned teachers for filter dialog
+    }
+    
+    print(f"[FINAL_RESPONSE] Quizzes in response: {len(response_data['quizzes'])}")
+    
+    return jsonify(response_data)
 
 
 
@@ -1335,177 +1637,193 @@ def get_file_type(file_extension):
         return 'document'
 
 
-# --- UPLOAD PROOF OF FILES PAGE ROUTE ---
+
+# --- UPLOAD PROOF OF FILES AND SUBMIT FOR ACTIVITIES ROUTE ---
 @app.route('/api/upload_task_files', methods=['POST'])
 def upload_task_files():
     """
-    Upload multiple files for task submission.
+    Upload multiple files and links for task submission.
     Updates task status to "Pending" and sends notifications.
     """
     try:
         user_id = request.form.get('user_id')
         task_id = request.form.get('task_id')
-        
+        links_json = request.form.get('links', '[]')  # Accept links as JSON string
+
         # Validate required fields
         if not user_id or not task_id:
-            return jsonify({
-                'success': False,
-                'message': 'Missing user_id or task_id'
-            }), 400
+            return jsonify({'success': False, 'message': 'Missing user_id or task_id'}), 400
+
+        # ✅ VALIDATE: User exists and is a student
+        user_resp = safe_execute(supabase.table('user_info').select('id, role').eq('id', int(user_id)).limit(1))
+        if not user_resp.data or user_resp.data[0].get('role') != 'Student':
+            return jsonify({'success': False, 'message': 'Invalid student account'}), 403
+
+        # ✅ VALIDATE: Task exists
+        task_resp = safe_execute(
+            supabase.table('task_assignments')
+            .select('task_id, status, due_date')
+            .eq('task_id', int(task_id))
+            .eq('student_id', int(user_id))
+            .limit(1)
+        )
+        if not task_resp.data:
+            return jsonify({'success': False, 'message': 'Task not found or not assigned to student'}), 404
+
+        task_data = task_resp.data[0]
         
-        # Check for files
-        if 'files' not in request.files or len(request.files.getlist('files')) == 0:
-            return jsonify({
-                'success': False,
-                'message': 'No files provided'
-            }), 400
-        
-        files = request.files.getlist('files')
+        # ✅ VALIDATE: Task not already submitted (only allow if status is 'Pending' for re-upload)
+        if task_data.get('status') == 'Completed' or task_data.get('status') == 'Approved':
+            return jsonify({'success': False, 'message': 'Cannot modify already submitted task'}), 400
+
+        # ✅ VALIDATE: Deadline check (optional - warn if past due)
+        if task_data.get('due_date'):
+            try:
+                due_date = parser.parse(str(task_data['due_date']))
+                now_ph = datetime.now(timezone('Asia/Manila'))
+                if now_ph > due_date:
+                    return jsonify({'success': False, 'message': 'Task deadline has passed'}), 400
+            except Exception:
+                pass
+
+        def normalize_links(raw_links):
+            normalized = []
+            if not isinstance(raw_links, list):
+                return normalized
+
+            for item in raw_links:
+                parsed_item = item
+                if isinstance(parsed_item, str):
+                    stripped = parsed_item.strip()
+                    if not stripped:
+                        continue
+                    if stripped.startswith('{') or stripped.startswith('['):
+                        try:
+                            parsed_item = json.loads(stripped)
+                            if isinstance(parsed_item, list) and parsed_item:
+                                parsed_item = parsed_item[0]
+                        except Exception:
+                            parsed_item = {'url': stripped, 'title': 'Link'}
+                    else:
+                        parsed_item = {'url': stripped, 'title': 'Link'}
+
+                if isinstance(parsed_item, dict):
+                    link_url = str(parsed_item.get('url') or parsed_item.get('link') or '').strip()
+                    if not link_url:
+                        continue
+                    link_title = str(parsed_item.get('title') or parsed_item.get('name') or 'Link').strip()
+                    normalized.append({
+                        'url': link_url,
+                        'title': link_title or 'Link'
+                    })
+
+            return normalized
+
+        # Parse links
+        try:
+            links = json.loads(links_json)
+        except Exception:
+            links = []
+        links = normalize_links(links)
+
+        files = request.files.getlist('files') if 'files' in request.files else []
         uploaded_files = []
         total_size = 0
-        
-        # ✅ PROCESS EACH FILE
+
+        # Process files
         for file in files:
             if not file or file.filename == '':
                 continue
-            
-            # Check if file is allowed
             if not allowed_file(file.filename):
-                continue
+                return jsonify({'success': False, 'message': f'File type not allowed: {file.filename}'}), 400
             
-            # Get file size
             file.seek(0, 2)
             file_size = file.tell()
             file.seek(0)
             
-            # Validate file size
-            if file_size == 0 or file_size > MAX_FILE_SIZE:
-                continue
+            # ✅ VALIDATE: Individual file size
+            if file_size == 0:
+                return jsonify({'success': False, 'message': f'File is empty: {file.filename}'}), 400
+            if file_size > MAX_FILE_SIZE:
+                return jsonify({'success': False, 'message': f'File too large (max 10MB): {file.filename}'}), 400
             
-            # Generate unique filename
+            # ✅ VALIDATE: Total upload size
+            if total_size + file_size > MAX_TOTAL_SIZE:
+                return jsonify({'success': False, 'message': f'Total upload exceeds 50MB limit'}), 400
+            
             file_ext = file.filename.rsplit('.', 1)[1].lower()
             unique_filename = f"task_{task_id}_user_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S%f')}.{file_ext}"
-            
-            # Get MIME type
             mime_type, _ = mimetypes.guess_type(file.filename)
             if not mime_type:
                 mime_type = 'application/octet-stream'
-            
             file_bytes = file.read()
             
-            try:
-                # ✅ UPLOAD TO SUPABASE STORAGE
-                response = supabase.storage.from_('task-files').upload(
-                    unique_filename, 
-                    file_bytes, 
-                    {"content-type": mime_type}
-                )
-                
-                # Generate public URL
-                public_url = f"https://bdcmzatfoaocnsfdpudv.supabase.co/storage/v1/object/public/task-files/{unique_filename}"
-                
-                uploaded_files.append({
-                    'filename': unique_filename,
-                    'original_filename': file.filename,
-                    'file_url': public_url,
-                    'file_size': file_size,
-                    'file_type': get_file_type(file_ext),
-                    'mime_type': mime_type
-                })
-                
-                total_size += file_size
-                
-            except Exception as e:
-                print(f"[UPLOAD] Error uploading file: {e}")
+            # MODIFIED: Upload to Supabase Storage in 'task-images' bucket instead of 'task-files'
+            storage_resp = supabase.storage.from_('task-images').upload(unique_filename, file_bytes, {"content-type": mime_type})
+            if hasattr(storage_resp, 'error') and storage_resp.error:
                 continue
+            
+            # MODIFIED: Update URL to use 'task-images' bucket
+            public_url = f"https://myetrhrskmbwnmmmxdzt.supabase.co/storage/v1/object/public/task-images/{unique_filename}"
+            uploaded_files.append({
+                'filename': unique_filename,
+                'original_filename': file.filename,
+                'file_url': public_url,
+                'file_type': get_file_type(file_ext),
+                'file_size': file_size,
+                'mime_type': mime_type,
+                'uploaded_at': datetime.now().isoformat(),
+                'student_id': user_id,
+                'task_id': task_id,
+            })
+            total_size += file_size
+
+        # Insert links as "virtual files"
+        for link in links:
+            link_title = link.get('title', 'Link')
+            link_url = link.get('url', '')
+            if not link_url:
+                continue
+            uploaded_files.append({
+                'filename': link_title,
+                'original_filename': link_title,
+                'file_url': link_url,
+                'file_type': 'link',
+                'file_size': 0,
+                'mime_type': 'link',
+                'uploaded_at': datetime.now().isoformat(),
+                'student_id': user_id,
+                'task_id': task_id,
+            })
+
+        # Insert all records
+        # ✅ VALIDATE: At least one file or link must be uploaded
+        if not uploaded_files:
+            return jsonify({'success': False, 'message': 'Please upload at least one file or link'}), 400
         
-        # ✅ INSERT RECORDS INTO DATABASE
         if uploaded_files:
-            records = []
-            for f in uploaded_files:
-                records.append({
-                    'task_id': int(task_id),
-                    'student_id': int(user_id),
-                    'filename': f['filename'],
-                    'original_filename': f['original_filename'],
-                    'file_url': f['file_url'],
-                    'file_size': f['file_size'],
-                    'file_type': f['file_type'],
-                    'mime_type': f['mime_type'],
-                })
-            
-            # Insert all records
-            result = safe_execute(supabase.table('task_file_submissions').insert(records))
-            print(f"[UPLOAD] Inserted {len(records)} file records")
-            
-            # ✅ UPDATE TASK STATUS TO PENDING
+            result = safe_execute(supabase.table('task_file_submissions').insert(uploaded_files))
+            print(f"[UPLOAD] Inserted {len(uploaded_files)} file/link records")
+
+            # Update task status, etc...
             now_ph = datetime.now(timezone('Asia/Manila')).isoformat()
             safe_execute(
                 supabase.table('task_assignments').update({
                     'status': 'Pending',
                     'submitted_at': now_ph,
-                    'completed_at': now_ph
+                    'completed_at': None
                 }).eq('task_id', int(task_id)).eq('student_id', int(user_id))
             )
-            print(f"[UPLOAD] Updated task {task_id} status to Pending")
-            
-            # ✅ GET TASK INFORMATION
-            task_info = safe_execute(
-                supabase.table('task_assignments')
-                .select('teacher_id, task, points')
-                .eq('task_id', int(task_id))
-            )
-            
-            if task_info.data and len(task_info.data) > 0:
-                task_data = task_info.data[0]
-                teacher_id = task_data.get('teacher_id')
-                task_name = task_data.get('task', '')
-                points = task_data.get('points', 0)
-                
-                # ✅ GET STUDENT INFORMATION
-                student_info = safe_execute(
-                    supabase.table('user_info')
-                    .select('first_name, last_name, role')
-                    .eq('id', int(user_id))
-                )
-                student_name = 'Student'
-                user_role = 'Student'
-                if student_info.data and len(student_info.data) > 0:
-                    student_name = f"{student_info.data[0].get('first_name', '')} {student_info.data[0].get('last_name', '')}".strip()
-                    user_role = student_info.data[0].get('role', 'Student')
-                
-                # ✅ SEND NOTIFICATION TO TEACHER
-                safe_execute(supabase.table('notifications').insert({
-                    'user_id': teacher_id,
-                    'sender_id': int(user_id),
-                    'title': 'Activity Submitted',
-                    'message': f"{student_name} has submitted the activity '{task_name}'. Please review and approve.",
-                    'task_id': int(task_id),
-                    'notif_type': 'Task',
-                    'status': 'Unread',
-                }))
-                print(f"[UPLOAD] Sent notification to teacher {teacher_id}")
-                
-                # ✅ LOG TO ACTIVITY LOG
-                safe_execute(supabase.table('admin_activity_log').insert({
-                    'user_id': int(user_id),
-                    'user_role': user_role,
-                    'action': 'Submit Activity',
-                    'activity': 'Activity Submission',
-                    'description': f"{student_name} submitted activity '{task_name}' ({len(uploaded_files)} file(s))",
-                    'details': f"Points: {points}, Files: {', '.join([f['original_filename'] for f in uploaded_files])}",
-                }))
-                print(f"[UPLOAD] Logged activity for student {user_id}")
-        
+
         return jsonify({
             'success': True,
-            'message': f'Successfully uploaded {len(uploaded_files)} file(s)',
+            'message': f'Successfully uploaded {len(uploaded_files)} file(s) and link(s)',
             'files_uploaded': len(uploaded_files),
             'total_size': total_size,
             'file_urls': uploaded_files,
             'new_status': 'Pending'
         }), 200
-        
+
     except Exception as e:
         print(f"[UPLOAD] Critical error: {e}")
         return jsonify({
@@ -1515,7 +1833,7 @@ def upload_task_files():
 
 
 
-# --- DISPLAY PROOF OF MARRIAGE IN TASK PAGE ROUTE ---
+# --- DISPLAY PROOF OF FILES IN ACTIVITIES PENDING ETC ROUTE ---
 @app.route('/api/get_task_files', methods=['GET'])
 def get_task_files():
     """
@@ -1564,7 +1882,734 @@ def get_task_files():
 
 
 
+# --- SUBMIT QUIZ ROUTE ---
+@app.route('/api/student/submit-quiz', methods=['POST'])
+def submit_student_quiz():
+    """Student submits quiz answers"""
+    print("[QUIZ_SUBMIT] ===== REQUEST DEBUG START =====")
+    try:
+        # ✅ DEBUG: Log EVERYTHING
+        print(f"[QUIZ_SUBMIT] Content-Type: {request.content_type}")
+        print(f"[QUIZ_SUBMIT] Raw data: {request.data[:500]}")  # First 500 bytes
+        
+        data = request.get_json()
+        print(f"[QUIZ_SUBMIT] Raw request data: {data}")
+        print(f"[QUIZ_SUBMIT] Data type: {type(data)}")
+        print(f"[QUIZ_SUBMIT] Data keys: {data.keys() if data else 'None'}")
+        
+        # ✅ FIXED: Accept student_id from request body (mobile apps don't use sessions)
+        # Check request body FIRST before session
+        student_id = data.get('student_id') if data else None
+        
+        # Only use session as fallback if request body didn't have student_id
+        if student_id is None:
+            student_id = session.get('user_id')
+        
+        # ✅ DEBUG LOGGING
+        print(f"[QUIZ_SUBMIT] Extracted student_id: {student_id}, type: {type(student_id)}")
+        
+        if not student_id:
+            print(f"[QUIZ_SUBMIT] ❌ Authentication failed - no student_id found")
+            return jsonify({'error': 'Not authenticated. Missing student_id'}), 401
+        
+        teacher_quiz_id = data.get('teacher_quiz_id')
+        answers = data.get('answers')
+        score = data.get('score')
+        time_spent = data.get('time_spent', 0)
+        is_retake = data.get('isRetake', False)  # ✅ NEW: Get isRetake flag from frontend
+        
+        # ✅ DETAILED ERROR LOGGING FOR DEBUG
+        print(f"[QUIZ_SUBMIT] teacher_quiz_id: {teacher_quiz_id} (type: {type(teacher_quiz_id)})")
+        print(f"[QUIZ_SUBMIT] answers: {answers} (type: {type(answers)}, length: {len(answers) if answers else 'None'})")
+        print(f"[QUIZ_SUBMIT] score: {score} (type: {type(score)})")
+        print(f"[QUIZ_SUBMIT] time_spent: {time_spent}")
+        print(f"[QUIZ_SUBMIT] is_retake: {is_retake}")  # ✅ NEW: Log retake flag
+        
+        # ✅ Validate each field individually
+        print(f"[QUIZ_SUBMIT] Validation checks:")
+        print(f"[QUIZ_SUBMIT]  - bool(teacher_quiz_id): {bool(teacher_quiz_id)}")
+        print(f"[QUIZ_SUBMIT]  - bool(answers): {bool(answers)}")
+        print(f"[QUIZ_SUBMIT]  - (score is not None): {score is not None}")
+        
+        # ✅ Convert teacher_quiz_id to int if needed
+        if teacher_quiz_id:
+            try:
+                teacher_quiz_id = int(teacher_quiz_id)
+            except (ValueError, TypeError):
+                print(f"[QUIZ_SUBMIT] ❌ Invalid teacher_quiz_id format: {teacher_quiz_id}")
+                return jsonify({'error': f'Invalid teacher_quiz_id: {teacher_quiz_id}'}), 400
+        
+        # Convert student_id to int
+        try:
+            student_id = int(student_id)
+        except (ValueError, TypeError):
+            print(f"[QUIZ_SUBMIT] ❌ Invalid student_id format: {student_id}")
+            return jsonify({'error': f'Invalid student_id: {student_id}'}), 400
+        
+        # Validate required fields
+        if not teacher_quiz_id or not answers or score is None:
+            error_msg = f'Missing required fields: teacher_quiz_id={teacher_quiz_id}, answers={answers is not None}, score={score}'
+            print(f"[QUIZ_SUBMIT] ❌ {error_msg}")
+            print("[QUIZ_SUBMIT] ===== REQUEST DEBUG END =====")
+            return jsonify({'error': error_msg}), 400
+        
+        print("[QUIZ_SUBMIT] ✅ All validations passed")
+        print("[QUIZ_SUBMIT] ===== REQUEST DEBUG END =====")
+        
+        # Get student info
+        student = safe_execute(
+            supabase.table('user_info')
+            .select('first_name', 'last_name', 'year_level', 'section')
+            .eq('id', student_id)
+        )
+        
+        if not student.data:
+            return jsonify({'error': 'Student not found'}), 404
+            
+        student_data = student.data[0]
+        student_name = f"{student_data['first_name']} {student_data['last_name']}"
+        
+        # Get quiz details
+        quiz = safe_execute(
+            supabase.table('teacher_quizzes')
+            .select('*')
+            .eq('id', teacher_quiz_id)
+        )
+        
+        if not quiz.data:
+            return jsonify({'error': 'Quiz not found'}), 404
+            
+        quiz_data = quiz.data[0]
+        teacher_name = quiz_data.get('teacher_name', 'Teacher')
+        
+        # Check for previous attempts (for retakes)
+        existing_attempts = safe_execute(
+            supabase.table('student_quiz_results')
+            .select('*')
+            .eq('teacher_quiz_id', teacher_quiz_id)
+            .eq('student_id', student_id)
+            .order('attempt_number', desc=True)
+        )
+        
+        # Determine attempt number and get previous best score
+        attempt_number = 1
+        previous_best_score = 0
+        previous_best_attempt_id = None
+        if existing_attempts.data:
+            attempt_number = max([a.get('attempt_number', 1) for a in existing_attempts.data]) + 1
+            
+            # Find the best score from all previous attempts
+            best_attempt = max(existing_attempts.data, key=lambda x: x.get('score', 0))
+            previous_best_score = best_attempt.get('score', 0)
+            previous_best_attempt_id = best_attempt.get('id', None)
+        
+        # Calculate total points based on items and points per item
+        points_per_item = quiz_data.get('points_per_item', 5)  # Default to 5 if not specified
+        total_items = quiz_data.get('total_items', len(answers))
+        total_points = total_items * points_per_item
+        
+        # Validate score doesn't exceed maximum
+        if score > total_points:
+            return jsonify({'error': 'Invalid score'}), 400
+        
+        # ✅ Calculate points earned and bonus based on retake logic
+        points_earned = int(score) if score else 0
+        bonus_points_earned = 0
+        is_best_score = True
+        
+        print(f"[QUIZ_SUBMIT] 🔍 CALCULATION DEBUG - score={score}, type={type(score)}, attempt#{attempt_number}")
+        print(f"[QUIZ_SUBMIT] 🔍 previous_best_score={previous_best_score}, total_points={total_points}")
+        
+        if attempt_number > 1:  # RETAKE ATTEMPT
+            # On retake: Award actual score earned on this attempt
+            points_earned = int(score) if score else 0
+            
+            # Bonus: Only if better than previous best
+            if score > previous_best_score:
+                # Improvement bonus = difference, but capped at max
+                improvement = score - previous_best_score
+                bonus_points_earned = int(min(improvement, total_points - previous_best_score))
+                is_best_score = True
+                print(f"[QUIZ_SUBMIT] 📈 RETAKE IMPROVEMENT: prev_best={previous_best_score}, current={score}, improvement={improvement}, bonus={bonus_points_earned}")
+            else:
+                # No improvement, no bonus
+                bonus_points_earned = 0
+                is_best_score = False
+                print(f"[QUIZ_SUBMIT] ❌ RETAKE NO IMPROVEMENT: prev_best={previous_best_score}, current={score}, bonus=0")
+        else:  # FIRST ATTEMPT
+            # First attempt: Full points earned
+            points_earned = int(score) if score else 0
+            bonus_points_earned = 0
+            is_best_score = True
+            print(f"[QUIZ_SUBMIT] ✅ FIRST ATTEMPT: score={score}, points_earned={points_earned}, bonus=0")
+        
+        # Prepare result data
+        result_data = {
+            'student_id': student_id,
+            'student_name': student_name,
+            'teacher_quiz_id': teacher_quiz_id,
+            'score': score,
+            'total_items': total_items,
+            'total_points': total_points,
+            'attempt_number': attempt_number,
+            'answers': json.dumps(answers),
+            'time_spent': time_spent,
+            'is_best_score': is_best_score,
+            'submitted_date': datetime.now(UTC).isoformat(),
+            # ✅ ADD ALL REQUIRED NOT NULL FIELDS
+            'topic': quiz_data.get('topic') or 'General',
+            'quarter': quiz_data.get('quarter') or 'Q1',
+            'grade_level': student_data.get('year_level') or 'Grade 7',
+            'section': student_data.get('section') or 'Unknown',
+            'teacher_name': quiz_data.get('teacher_name', 'Teacher'),
+            'teacher_id': quiz_data.get('teacher_id', 0),
+            # ✅ WRITE RETAKE FLAG TO DATABASE
+            'retake': is_retake,
+            # ✅ STORE POINTS EARNED AND BONUS SEPARATELY (EXPLICIT TYPE CONVERSION)
+            'points_earned': int(points_earned),
+            'bonus_points_earned': int(bonus_points_earned),
+            # ✅ STORE PREVIOUS BEST SCORE FOR RETAKE COMPARISON (NULL for first attempt)
+            'previous_best_score': int(previous_best_score) if attempt_number > 1 and previous_best_score > 0 else None,
+        }
+        
+        # ✅ DEBUG: Print what we're inserting
+        print(f"[QUIZ_SUBMIT] ✅ PREPARED FOR INSERT:")
+        print(f"[QUIZ_SUBMIT]   - points_earned: {points_earned} (type: {type(points_earned).__name__})")
+        print(f"[QUIZ_SUBMIT]   - bonus_points_earned: {bonus_points_earned} (type: {type(bonus_points_earned).__name__})")
+        print(f"[QUIZ_SUBMIT]   - previous_best_score: {previous_best_score if attempt_number > 1 else None}")
+        print(f"[QUIZ_SUBMIT]   - attempt_number: {attempt_number}")
+        print(f"[QUIZ_SUBMIT]   - score: {score}")
+        print(f"[QUIZ_SUBMIT] result_data keys: {result_data.keys()}")
+        print(f"[QUIZ_SUBMIT] FULL result_data: {result_data}")
+        
+        # Insert the result
+        result = safe_execute(
+            supabase.table('student_quiz_results').insert(result_data)
+        )
+        
+        print(f"[QUIZ_SUBMIT] Insert result: {result}")
+        print(f"[QUIZ_SUBMIT] Insert result type: {type(result)}")
+        print(f"[QUIZ_SUBMIT] Insert result dir: {dir(result)}")
+        
+        if result.data:
+            print(f"[QUIZ_SUBMIT] ✅ INSERT SUCCESS - data returned:")
+            for key, value in result.data[0].items():
+                print(f"[QUIZ_SUBMIT]   {key}: {value} (type: {type(value).__name__})")
+        else:
+            print(f"[QUIZ_SUBMIT] ❌ INSERT FAILED - no data in response")
+            if hasattr(result, 'error'):
+                print(f"[QUIZ_SUBMIT] Error: {result.error}")
+            if hasattr(result, 'status_code'):
+                print(f"[QUIZ_SUBMIT] Status code: {result.status_code}")
+        
+        if not result.data:
+            return jsonify({'error': 'Failed to save quiz result', 'debug_response': str(result)}), 500
+        
+        # ✅ Calculate total points to award (points_earned + bonus_points_earned)
+        total_points_to_award = points_earned + bonus_points_earned
+        
+        # Insert points record
+        points_data = {
+            'student_id': student_id,
+            'teacher_id': quiz_data['teacher_id'],
+            'points': total_points_to_award,
+            'point_category': 'Quiz',
+            'note': f"Quiz: {quiz_data['topic']} - Score: {score}/{total_points} | Earned: {points_earned}, Bonus: {bonus_points_earned}",
+            'status': 'approved'
+        }
+        
+        print(f"[QUIZ_SUBMIT] 💰 Awarding points: {total_points_to_award} (earned={points_earned} + bonus={bonus_points_earned})")
+        
+        points_result = safe_execute(
+            supabase.table('points').insert(points_data)
+        )
+        
+        if not points_result.data:
+            logger.warning(f"Failed to insert points for student {student_id} on quiz {teacher_quiz_id}")
+        
+        # Update student's total_points in user_info table
+        try:
+            # Get current total_points
+            current_user = safe_execute(
+                supabase.table('user_info')
+                .select('total_points')
+                .eq('id', student_id)
+            )
+            
+            current_total = current_user.data[0]['total_points'] if current_user.data and current_user.data[0]['total_points'] else 0
+            new_total = current_total + points_earned
+            
+            # Update total_points in user_info
+            update_result = safe_execute(
+                supabase.table('user_info')
+                .update({'total_points': new_total})
+                .eq('id', student_id)
+            )
+        except Exception as e:
+            logger.error(f"Error updating total_points for student {student_id}: {e}")
+        
+        # Create teacher notification
+        try:
+            safe_execute(supabase.table('notifications').insert({
+                'user_id': quiz_data['teacher_id'],
+                'sender_id': student_id,
+                'title': f'Quiz Submission - {student_name}',
+                'message': f'{student_name} submitted the quiz "{quiz_data.get("quiz_title", "Untitled")}" with a score of {score}/{total_points}',
+                'type': 'quiz_submission',
+                'related_id': result.data[0]['id'],
+                'status': 'Unread',
+            }))
+        except Exception as e:
+            logger.error(f"Error creating teacher notification: {e}")
+        
+        # ✅ Insert admin activity log
+        try:
+            safe_execute(supabase.table('admin_activity_log').insert({
+                'user_id': student_id,
+                'user_role': 'Student',
+                'action': 'Quiz Submission',
+                'activity': 'Assessment',
+                'description': f"Student {student_data['last_name']} submitted quiz '{quiz_data.get('title', 'Untitled')}' (Attempt {attempt_number})",
+                'details': f"Quiz: {quiz_data.get('title', 'Untitled')}\nScore: {score}/{total_points}\nTopic: {quiz_data.get('topic', 'N/A')}\nTeacher: {teacher_name}\nTime Spent: {time_spent} seconds\nPoints Earned: {points_earned}\nAttempt: {attempt_number}",
+            }))
+        except Exception as e:
+            logger.error(f"Error logging to admin_activity_log: {e}")
+        
+        # Log the submission
+        logger.info(f"Student {student_id} submitted quiz {teacher_quiz_id} (attempt {attempt_number}) with score {score}/{total_points} and earned {points_earned} points")
+        
+        message = f'Quiz submitted! Score: {score}/{total_points}'
+        if attempt_number > 1:
+            if is_best_score:
+                message += f' (+{bonus_points_earned} bonus points - New best score!)'
+            else:
+                message += f' (No bonus points - keep trying!)'
+        
+        return jsonify({
+            'success': True,
+            'result_id': result.data[0]['id'],
+            'message': message,
+            'percentage': (score / total_points) * 100 if total_points > 0 else 0,
+            'attempt_number': attempt_number,
+            'previous_best_score': previous_best_score if attempt_number > 1 else None,
+            'bonus_points_earned': bonus_points_earned,
+            'is_best_score': is_best_score
+        }), 200
+        
+    except Exception as e:
+        import traceback
+        print(f"[QUIZ_SUBMIT] ❌ EXCEPTION: {str(e)}")
+        print(f"[QUIZ_SUBMIT] ❌ Exception type: {type(e).__name__}")
+        print(f"[QUIZ_SUBMIT] ❌ Traceback:\n{traceback.format_exc()}")
+        print("[QUIZ_SUBMIT] ===== REQUEST DEBUG END (ERROR) =====")
+        logger.error(f"Error submitting quiz: {e}")
+        return jsonify({'error': str(e), 'type': type(e).__name__}), 500
+
+
+
+
+
+# --- GET COMPLETED QUIZZES FOR STUDENT ---
+@app.route('/api/get_completed_quizzes', methods=['GET'])
+def get_completed_quizzes():
+    """
+    ✅ SIMPLIFIED ROUTE: Fetch ONLY the quiz IDs that have been completed by the student
+    This endpoint returns a simple list of quiz IDs from the student_quiz_results table
     
+    Purpose: Filter out completed quizzes from the "To Do" tab in the student interface
+    So students only see quizzes they haven't taken yet
+    
+    Returns: {'completed_quiz_ids': [1, 2, 3, ...]}
+    """
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({'error': 'Missing user_id'}), 400
+
+    try:
+        print(f"[COMPLETED_QUIZZES] Fetching completed quiz IDs for student {user_id}...")
+        
+        # ✅ SIMPLE: Get ONLY the teacher_quiz_id from student_quiz_results
+        completed_resp = safe_execute(
+            supabase.table('student_quiz_results')
+            .select('teacher_quiz_id')  # ← Only get the quiz ID
+            .eq('student_id', int(user_id))
+        )
+        completed_records = completed_resp.data if completed_resp and completed_resp.data else []
+
+        # ✅ Extract unique quiz IDs (in case student took same quiz multiple times)
+        completed_quiz_ids = []
+        for record in completed_records:
+            quiz_id = record.get('teacher_quiz_id')
+            if quiz_id and quiz_id not in completed_quiz_ids:
+                completed_quiz_ids.append(quiz_id)
+        
+        print(f"[COMPLETED_QUIZZES] Found {len(completed_quiz_ids)} completed quiz IDs for student {user_id}")
+        if completed_quiz_ids:
+            print(f"[COMPLETED_QUIZZES] Completed quiz IDs: {completed_quiz_ids}")
+        
+        return jsonify({
+            'completed_quiz_ids': completed_quiz_ids,
+            'count': len(completed_quiz_ids)
+        })
+
+    except Exception as e:
+        print(f"[COMPLETED_QUIZZES] ERROR: {e}")
+        import traceback
+        print(f"[COMPLETED_QUIZZES] Traceback: {traceback.format_exc()}")
+        return jsonify({'error': 'Failed to fetch completed quizzes'}), 500
+
+
+# ✅ GET QUIZ RESULT DETAILS - for completed quiz card click
+@app.route('/api/get_quiz_result', methods=['GET'])
+def get_quiz_result():
+    """
+    Fetch a specific quiz result with all details (questions, answers, score)
+    Parameters: student_id, teacher_quiz_id
+    """
+    try:
+        student_id = request.args.get('student_id')
+        teacher_quiz_id = request.args.get('teacher_quiz_id')
+        
+        if not student_id or not teacher_quiz_id:
+            return jsonify({'error': 'Missing parameters'}), 400
+        
+        # Get quiz result
+        result_resp = safe_execute(
+            supabase.table('student_quiz_results')
+            .select('*')
+            .eq('student_id', int(student_id))
+            .eq('teacher_quiz_id', int(teacher_quiz_id))
+            .order('attempt_number', desc=True)
+            .limit(1)
+        )
+        
+        if not result_resp or not result_resp.data:
+            return jsonify({'error': 'Quiz result not found'}), 404
+        
+        quiz_result = result_resp.data[0]
+        
+        # Get quiz details
+        quiz_resp = safe_execute(
+            supabase.table('teacher_quizzes')
+            .select('*')
+            .eq('id', int(teacher_quiz_id))
+        )
+        
+        if not quiz_resp or not quiz_resp.data:
+            return jsonify({'error': 'Quiz not found'}), 404
+        
+        quiz = quiz_resp.data[0]
+        
+        # Get teacher info
+        teacher_name = ''
+        teacher_subject = ''
+        teacher_id = quiz.get('teacher_id')
+        
+        if teacher_id:
+            try:
+                teacher_resp = safe_execute(
+                    supabase.table('user_info')
+                    .select('first_name, last_name, subject')
+                    .eq('id', teacher_id)
+                )
+                if teacher_resp and teacher_resp.data:
+                    teacher = teacher_resp.data[0]
+                    teacher_name = f"{teacher.get('first_name', '')} {teacher.get('last_name', '')}".strip()
+                    teacher_subject = teacher.get('subject', '')
+            except:
+                pass
+        
+        # Parse quiz_datawala pa din nalabas
+        quiz_data = quiz.get('quiz_data', [])
+        questions = []
+        
+        try:
+            if isinstance(quiz_data, str):
+                quiz_data = json.loads(quiz_data)
+            
+            if isinstance(quiz_data, list):
+                questions = quiz_data
+            elif isinstance(quiz_data, dict):
+                questions = quiz_data.get('questions', [])
+        except:
+            questions = []
+        
+        # Parse answers
+        student_answers = quiz_result.get('answers', [])
+        try:
+            if isinstance(student_answers, str):
+                student_answers = json.loads(student_answers)
+            if not isinstance(student_answers, list):
+                student_answers = []
+        except:
+            student_answers = []
+        
+        # Calculate metrics
+        score = int(quiz_result.get('score', 0) or 0)
+        total_items = int(quiz_result.get('total_items', 0) or 0)
+        percentage = (score / total_items * 100) if total_items > 0 else 0
+        attempt_number = int(quiz_result.get('attempt_number', 1) or 1)
+
+        def to_int_score(value, default=0):
+            try:
+                if value is None or value == '':
+                    return int(default)
+                if isinstance(value, bool):
+                    return int(default)
+                if isinstance(value, (int, float)):
+                    return int(value)
+                return int(float(str(value)))
+            except Exception:
+                return int(default)
+
+        # Build attempt score timeline so UI can show 1st vs current attempt points.
+        attempts_with_scores = []
+        try:
+            attempts_scores_resp = safe_execute(
+                supabase.table('student_quiz_results')
+                .select('attempt_number, score')
+                .eq('student_id', int(student_id))
+                .eq('teacher_quiz_id', int(teacher_quiz_id))
+                .order('attempt_number')
+            )
+            attempts_with_scores = attempts_scores_resp.data if attempts_scores_resp and attempts_scores_resp.data else []
+        except Exception as attempts_err:
+            print(f"[GET_QUIZ_RESULT] ⚠️ Failed attempts timeline fetch: {attempts_err}")
+
+        first_attempt_score = score
+        previous_attempt_score = 0
+        if attempts_with_scores:
+            first_attempt_score = to_int_score(attempts_with_scores[0].get('score'), score)
+            if attempt_number > 1:
+                for row in attempts_with_scores:
+                    if int(row.get('attempt_number', 0) or 0) == attempt_number - 1:
+                        previous_attempt_score = to_int_score(row.get('score'), 0)
+                        break
+                if previous_attempt_score == 0 and len(attempts_with_scores) >= 2:
+                    previous_attempt_score = to_int_score(attempts_with_scores[-2].get('score'), 0)
+
+        # User-requested computation: improvement against the 1st attempt score.
+        improvement_points = max(score - first_attempt_score, 0) if attempt_number > 1 else 0
+        
+        time_limit = quiz.get('time_limit_minutes', 0)
+        if time_limit and time_limit > 60:
+            time_limit = int(time_limit / 60)
+        
+        points_per_item = quiz.get('points_per_item', 0)
+        submitted_at = quiz_result.get('submitted_date') or quiz_result.get('created_at')
+        completed_at = quiz_result.get('completed_at') or submitted_at
+        # Always return quiz timestamps in Asia/Manila so clients render consistent PH time.
+        submitted_at_ph = format_date(submitted_at)
+        completed_at_ph = format_date(completed_at)
+        
+        # Get total attempts
+        total_attempts = len(attempts_with_scores) if attempts_with_scores else 1
+        
+        # Retake button must appear only when retake column is TRUE on latest attempt.
+        raw_retake_flag = quiz_result.get('retake', False)
+        if isinstance(raw_retake_flag, str):
+            retake_flag = raw_retake_flag.strip().lower() in ('true', '1', 'yes', 'y')
+        else:
+            retake_flag = bool(raw_retake_flag)
+        can_retake = retake_flag and total_attempts < 2
+        retake_note = 'Retake enabled by teacher.' if retake_flag else None
+        
+        # ✅ DEBUG: Log what we're returning
+        print(f"[GET_QUIZ_RESULT] DEBUG - can_retake: {can_retake}, retake_flag: {retake_flag}, total_attempts: {total_attempts}, attempt_number: {quiz_result.get('attempt_number', 1)}")
+        
+        # Return response
+        return jsonify({
+            'success': True,
+            'quiz': {
+                'id': quiz.get('id'),
+                'title': quiz.get('quiz_title', 'Unknown Quiz'),
+                'instructions': quiz.get('instructions'),
+                'total_items': total_items,
+                'total_points': quiz.get('total_points', 0),
+                'points_per_item': points_per_item,
+                'time_limit_minutes': time_limit,
+                'topic': quiz.get('topic', ''),
+                'quarter': quiz.get('quarter', ''),
+                'teacher_name': teacher_name,
+                'teacher_subject': teacher_subject,
+            },
+            'result': {
+                'score': score,
+                'total_items': total_items,
+                'percentage': round(percentage, 2),
+                'passed': percentage >= 60,
+                'time_spent': quiz_result.get('time_spent', 0),
+                'completed_at': completed_at_ph,
+                'submitted_at': submitted_at_ph,
+                'attempt_number': attempt_number,
+                'first_attempt_score': first_attempt_score,
+                'previous_attempt_score': previous_attempt_score if attempt_number > 1 else None,
+                'improvement_points': improvement_points,
+                'bonus_points_earned': int(quiz_result.get('bonus_points_earned', 0) or 0),
+            },
+            'questions': questions,
+            'answers': student_answers,
+            'retake_info': {
+                'attempt_number': attempt_number,
+                'can_retake': can_retake,
+                'retake_flag': retake_flag,
+                'total_attempts': total_attempts,
+                'total_attempts_allowed': 2,
+                'retake_note': retake_note,
+                'improvement_points': improvement_points,
+                'first_attempt_score': first_attempt_score,
+                'previous_attempt_score': previous_attempt_score if attempt_number > 1 else None,
+            }
+        })
+        
+    except Exception as e:
+        print(f"[GET_QUIZ_RESULT] ERROR: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': 'Failed to fetch quiz result'}), 500
+
+
+
+#✅ DEBUG ENDPOINT: Check what notifications exist for a student
+@app.route('/api/debug/student-notifications', methods=['GET'])
+def debug_student_notifications():
+    """DEBUG: Check what notifications exist for a student"""
+    student_id = request.args.get('student_id')
+    
+    if not student_id:
+        return jsonify({'error': 'Missing student_id'}), 400
+    
+    try:
+        # Get ALL notifications for this student
+        all_notifs = safe_execute(
+            supabase.table('notifications')
+            .select('*')
+            .eq('user_id', int(student_id))
+        )
+        
+        # Get ONLY retake allowed notifications
+        retake_notifs = safe_execute(
+            supabase.table('notifications')
+            .select('*')
+            .eq('user_id', int(student_id))
+            .eq('title', 'Quiz Retake Allowed')
+        )
+        
+        return jsonify({
+            'student_id': student_id,
+            'all_notifications': all_notifs.data if all_notifs and all_notifs.data else [],
+            'retake_notifications': retake_notifs.data if retake_notifs and retake_notifs.data else [],
+            'total_all': len(all_notifs.data) if all_notifs and all_notifs.data else 0,
+            'total_retake': len(retake_notifs.data) if retake_notifs and retake_notifs.data else 0,
+        }), 200
+        
+    except Exception as e:
+        print(f"[DEBUG_NOTIF] ERROR: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
+#✅ KEEP: Check if student can retake quiz
+@app.route('/api/check-quiz-retake', methods=['GET'])
+def check_quiz_retake():
+    """Check if student is allowed to retake a quiz"""
+    student_id = request.args.get('student_id')
+    teacher_quiz_id = request.args.get('teacher_quiz_id')
+    
+    print(f"[CHECK_RETAKE] 🔍 Checking retake for student_id={student_id}, quiz_id={teacher_quiz_id}")
+    
+    if not student_id or not teacher_quiz_id:
+        return jsonify({'error': 'Missing student_id or teacher_quiz_id'}), 400
+    
+    try:
+        # Get all attempts for this quiz
+        attempts_resp = safe_execute(
+            supabase.table('student_quiz_results')
+            .select('id, attempt_number, retake, score')
+            .eq('teacher_quiz_id', int(teacher_quiz_id))
+            .eq('student_id', int(student_id))
+            .order('attempt_number', desc=True)
+        )
+        
+        attempts = attempts_resp.data if attempts_resp.data else []
+        attempt_count = len(attempts)
+        
+        # ✅ DEBUG: Log all attempts found
+        print(f"[CHECK_RETAKE] Found {attempt_count} attempt(s)")
+        for i, attempt in enumerate(attempts):
+            print(f"[CHECK_RETAKE]   Attempt {i+1}: attempt_number={attempt.get('attempt_number')}, retake={attempt.get('retake')}, score={attempt.get('score')}")
+        
+        # Determine if retake is allowed
+        can_retake = False
+        last_attempt_retake_approved = False
+        
+        if attempt_count > 0:
+            last_attempt = attempts[0]  # Most recent
+            last_attempt_retake_approved = last_attempt.get('retake', False)
+            print(f"[CHECK_RETAKE] Last attempt retake flag (DB): {last_attempt_retake_approved}")
+            
+            # ✅ NEW: Also check for "Quiz Retake Allowed" notification (like get_quiz_result does)
+            try:
+                notif_resp = safe_execute(
+                    supabase.table('notifications')
+                    .select('id, title, message')
+                    .eq('user_id', int(student_id))
+                    .ilike('title', '%Quiz Retake Allowed%')
+                    .order('created_at', desc=True)
+                    .limit(1)
+                )
+                
+                if notif_resp and notif_resp.data:
+                    notif = notif_resp.data[0]
+                    quiz_title = last_attempt.get('quiz_title', '')
+                    notif_message = notif.get('message', '')
+                    
+                    if quiz_title.lower() in notif_message.lower():
+                        last_attempt_retake_approved = True
+                        print(f"[CHECK_RETAKE] ✅ Found matching notification: '{notif.get('title')}'")
+            except Exception as e:
+                print(f"[CHECK_RETAKE] ⚠️ Error checking notification: {e}")
+            
+            # Can retake if: attempt < 2 AND last attempt had retake approved
+            if attempt_count < 2 and last_attempt_retake_approved:
+                can_retake = True
+                print(f"[CHECK_RETAKE] ✅ RETAKE ALLOWED (attempts left: {2 - attempt_count})")
+            else:
+                print(f"[CHECK_RETAKE] ❌ Retake NOT allowed (attempts: {attempt_count}/2, retake_approved: {last_attempt_retake_approved})")
+        else:
+            print(f"[CHECK_RETAKE] ⚠️ No attempts found yet")
+        
+        response = {
+            'success': True,
+            'attempt_number': attempt_count,
+            'can_retake': can_retake,
+            'retake_approved': last_attempt_retake_approved,
+            'max_attempts': 2,
+            'attempts_remaining': max(0, 2 - attempt_count)
+        }
+        print(f"[CHECK_RETAKE] Response: {response}")
+        return jsonify(response), 200
+        
+    except Exception as e:
+        print(f"[CHECK_RETAKE] ❌ ERROR: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+    
+# ====================================================================================================
+#                                         STUDENT ACTIVITIES PAGE END
+# ====================================================================================================
+
+
+
+# ====================================================================================================
+#                                         STUDENT REWARDS PAGE START
+# ====================================================================================================
+
+
+
 
 # --- DISPLAY REWARDS IN REWARDS PAGE ROUTE ---
 @app.route('/rewards', methods=['GET'])
@@ -1600,6 +2645,12 @@ def get_rewards():
         user_id = request.args.get('user_id')
         if not user_id:
             return jsonify({'success': False, 'error': 'Missing user_id'}), 400
+
+        # ✅ Convert user_id to int to match database type
+        try:
+            user_id = int(user_id)
+        except (ValueError, TypeError):
+            return jsonify({'success': False, 'error': 'Invalid user_id format'}), 400
 
         # Fetch student's year_level and section from user_info
         user_resp = safe_execute(
@@ -1708,10 +2759,45 @@ def get_rewards():
             r['teacher_subject'] = teacher_subject
             r['teacher_profile_picture'] = teacher_profile_picture
 
-        redeemed_resp = safe_execute(supabase.table('reward_redemptions')
+        # ✅ OPTIMIZED: Fetch ALL redemptions ONCE (not per reward)
+        print(f"\n[REWARDS] Fetching all redemptions for student_id: {user_id}")
+        all_redemptions_resp = safe_execute(
+            supabase.table('reward_redemptions')
             .select('reward_id')
-            .eq('student_id', user_id))
-        redeemed_ids = [int(r['reward_id']) for r in redeemed_resp.data if r.get('reward_id') is not None] if redeemed_resp.data else []
+            .eq('student_id', user_id)
+        )
+        
+        # Build redemption count map in memory (reward_id -> count)
+        redemption_count_map = {}
+        if all_redemptions_resp.data:
+            for r in all_redemptions_resp.data:
+                reward_id = int(r.get('reward_id', 0)) if r.get('reward_id') else 0
+                if reward_id > 0:
+                    redemption_count_map[reward_id] = redemption_count_map.get(reward_id, 0) + 1
+        
+        redeemed_ids = list(redemption_count_map.keys())
+        print(f"[REWARDS] Total unique rewards redeemed by student: {len(redeemed_ids)}")
+
+        # ✅ ADD redemption limit info to each reward (SIMPLIFIED: all-time count)
+        print(f"[REWARDS] Processing {len(filtered_rewards)} rewards...")
+        for r in filtered_rewards:
+            reward_id = r['reward_id']
+            # Get count from pre-fetched map (NO database query)
+            redemption_count = redemption_count_map.get(reward_id, 0)
+            remaining_redeems = max(0, 3 - redemption_count)
+            can_redeem = (redemption_count < 3)
+            
+            r['redemption_count'] = redemption_count
+            r['remaining_redeems'] = remaining_redeems
+            r['can_redeem'] = can_redeem
+            print(f"[REWARDS] Reward {reward_id}: count={redemption_count}, remaining={remaining_redeems}")
+
+        # ✅ DEBUG: Show first reward object before sending
+        if filtered_rewards:
+            first_reward = filtered_rewards[0]
+            print(f"[REWARDS_DEBUG] First reward keys: {list(first_reward.keys())}")
+            print(f"[REWARDS_DEBUG] remaining_redeems in first reward: {first_reward.get('remaining_redeems', 'NOT FOUND')}")
+            print(f"[REWARDS_DEBUG] redemption_count in first reward: {first_reward.get('redemption_count', 'NOT FOUND')}")
 
         return jsonify({
             'success': True,
@@ -1724,6 +2810,94 @@ def get_rewards():
         }), 200
     except Exception as e:
         print(f"Error fetching rewards: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+
+# --- GET TOP 3 MOST POPULAR/REDEEMED REWARDS ---
+@app.route('/top_rewards', methods=['GET'])
+def get_top_rewards():
+    """
+    Get top 3 most frequently redeemed rewards from reward_redemptions table.
+    """
+    print("\n" + "="*80)
+    print("[TOP_REWARDS] 🟢 REQUEST RECEIVED: GET /top_rewards")
+    print("="*80)
+    
+    try:
+        # Step 1: Get ALL redemption records and count by reward_id
+        print("[TOP_REWARDS] 📊 Step 1: Fetching ALL reward_redemptions records...")
+        redemptions_resp = safe_execute(
+            supabase.table('reward_redemptions')
+            .select('reward_id')
+        )
+        
+        print(f"[TOP_REWARDS] 📊 Step 1 Result: Got {len(redemptions_resp.data) if redemptions_resp.data else 0} redemption records")
+        if redemptions_resp.data:
+            print(f"[TOP_REWARDS] 📊 Sample data: {redemptions_resp.data[:3]}")
+        
+        if not redemptions_resp.data:
+            print("[TOP_REWARDS] ⚠️  No redemption records found - returning empty list")
+            return jsonify({'success': True, 'top_rewards': []}), 200
+        
+        # Count redemptions per reward_id
+        print("[TOP_REWARDS] 🔢 Step 2: Counting redemptions per reward_id...")
+        redemption_counts = {}
+        for record in redemptions_resp.data:
+            reward_id = record.get('reward_id')
+            if reward_id:
+                redemption_counts[reward_id] = redemption_counts.get(reward_id, 0) + 1
+        
+        print(f"[TOP_REWARDS] 🔢 Total unique rewards with redemptions: {len(redemption_counts)}")
+        print(f"[TOP_REWARDS] 🔢 Redemption counts: {redemption_counts}")
+        
+        # Step 2: Sort and get top 3 reward IDs
+        print("[TOP_REWARDS] 🏆 Step 3: Sorting to get TOP 3...")
+        sorted_rewards = sorted(redemption_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+        top_reward_ids = [rid for rid, count in sorted_rewards]
+        
+        print(f"[TOP_REWARDS] 🏆 Top 3 sorted by count: {sorted_rewards}")
+        print(f"[TOP_REWARDS] 🏆 Top 3 reward IDs: {top_reward_ids}")
+        
+        if not top_reward_ids:
+            print("[TOP_REWARDS] ⚠️  No top reward IDs found - returning empty list")
+            return jsonify({'success': True, 'top_rewards': []}), 200
+        
+        # Step 3: Fetch reward details for each top reward
+        print("[TOP_REWARDS] 📝 Step 4: Fetching reward DETAILS from rewards table...")
+        top_rewards = []
+        for reward_id in top_reward_ids:
+            try:
+                print(f"[TOP_REWARDS] 📝 Fetching details for reward_id: {reward_id}")
+                reward_resp = safe_execute(
+                    supabase.table('rewards')
+                    .select('reward_id, reward_name, description, category, point_cost, available_quantity, created_by, status')
+                    .eq('reward_id', reward_id)
+                    .limit(1)
+                )
+                
+                if reward_resp.data and len(reward_resp.data) > 0:
+                    reward = reward_resp.data[0]
+                    reward['redemption_count'] = redemption_counts.get(reward_id, 0)
+                    top_rewards.append(reward)
+                    print(f"[TOP_REWARDS] ✅ Added reward: {reward.get('reward_name', 'Unknown')} (ID: {reward_id}, Redeemed: {reward['redemption_count']} times)")
+                else:
+                    print(f"[TOP_REWARDS] ⚠️  No reward data found for reward_id: {reward_id}")
+            except Exception as inner_e:
+                print(f"[TOP_REWARDS] ❌ Error fetching reward {reward_id}: {inner_e}")
+                print(f"[TOP_REWARDS] ❌ Error type: {type(inner_e)}")
+                continue
+        
+        print(f"\n[TOP_REWARDS] 🎉 FINAL RESPONSE: {len(top_rewards)} rewards ready to send")
+        print(f"[TOP_REWARDS] 🎉 Response payload: {top_rewards}")
+        print("="*80 + "\n")
+        
+        return jsonify({'success': True, 'top_rewards': top_rewards}), 200
+    except Exception as e:
+        print(f"[TOP_REWARDS] 💥 CRITICAL ERROR in get_top_rewards: {e}")
+        print(f"[TOP_REWARDS] 💥 Error type: {type(e)}")
+        print(f"[TOP_REWARDS] 💥 Full traceback: {e}")
+        print("="*80 + "\n")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
@@ -1742,17 +2916,33 @@ def redeem_reward():
         if student_id is None or reward_id is None or grade_level is None or section is None or points_deducted is None:
             return jsonify({'success': False, 'error': 'Missing required fields'}), 400
 
-        # 1. Check if student already redeemed this reward
-        already_redeemed = safe_execute(supabase.table('reward_redemptions') \
-            .select('redemption_id') \
-            .eq('student_id', student_id) \
-            .eq('reward_id', reward_id))
-        if already_redeemed.data and len(already_redeemed.data) > 0:
-            print('ALREADY REDEEMED')
-            return jsonify({'success': False, 'error': 'You have already redeemed this reward.'}), 400
+        # ✅ SIMPLIFIED: Check 3-redeem limit (total, not quarterly)
+        student_id_int = int(student_id) if isinstance(student_id, str) else student_id
+        reward_id_int = int(reward_id) if isinstance(reward_id, str) else reward_id
+        
+        print(f"[REDEEM_CHECK] Student {student_id_int} attempting to redeem reward {reward_id_int}")
+        
+        # Count total redemptions of this reward by this student (all-time)
+        redeem_count_resp = safe_execute(
+            supabase.table('reward_redemptions')
+            .select('redemption_id')
+            .eq('student_id', student_id_int)
+            .eq('reward_id', reward_id_int)
+        )
+        
+        redemption_count = len(redeem_count_resp.data) if redeem_count_resp.data else 0
+        remaining_redeems = max(0, 3 - redemption_count)
+        
+        print(f"[REDEEM_CHECK] Total redeems: {redemption_count}, Remaining: {remaining_redeems}")
+        
+        if redemption_count >= 3:
+            print(f"[REDEEM_CHECK] ❌ Reached 3-redeem limit for reward {reward_id_int}")
+            return jsonify({'success': False, 'error': 'You have reached the maximum redeems (3) for this reward.'}), 400
+        
+        print(f"[REDEEM_CHECK] ✅ Can redeem - {remaining_redeems} redeems left")
 
         # 2. Check reward quantity
-        reward_resp = safe_execute(supabase.table('rewards').select('available_quantity, created_by').eq('reward_id', reward_id))
+        reward_resp = safe_execute(supabase.table('rewards').select('available_quantity, created_by').eq('reward_id', reward_id_int))
         if not reward_resp.data or len(reward_resp.data) == 0:
             return jsonify({'success': False, 'error': 'Reward not found'}), 404
 
@@ -1763,7 +2953,7 @@ def redeem_reward():
             return jsonify({'success': False, 'error': 'Reward is out of stock'}), 400
 
         # 3. Deduct points from user_info
-        user_resp = safe_execute(supabase.table('user_info').select('total_points').eq('id', student_id))
+        user_resp = safe_execute(supabase.table('user_info').select('total_points').eq('id', student_id_int))
         if not user_resp.data or len(user_resp.data) == 0:
             return jsonify({'success': False, 'error': 'User not found'}), 404
 
@@ -1775,15 +2965,16 @@ def redeem_reward():
         new_points = current_points - points_deducted
 
         # 4. Update user points
-        safe_execute(supabase.table('user_info').update({'total_points': new_points}).eq('id', student_id))
+        safe_execute(supabase.table('user_info').update({'total_points': new_points}).eq('id', student_id_int))
 
         # 5. Update reward quantity
-        safe_execute(supabase.table('rewards').update({'available_quantity': available_quantity - 1}).eq('reward_id', reward_id))
+        safe_execute(supabase.table('rewards').update({'available_quantity': available_quantity - 1}).eq('reward_id', reward_id_int))
 
         # 6. Insert into reward_redemptions (WITH REMARKS)
+        # ✅ USE CONVERTED INT VALUES for proper database insert
         redemption_resp = safe_execute(supabase.table('reward_redemptions').insert({
-            'student_id': student_id,
-            'reward_id': reward_id,
+            'student_id': student_id_int,
+            'reward_id': reward_id_int,
             'grade_level': grade_level,
             'section': section,
             'points_deducted': points_deducted,
@@ -1799,16 +2990,16 @@ def redeem_reward():
 
         # --- Insert into admin_activity_log ---
         # Get student info for log
-        student_resp = safe_execute(supabase.table('user_info').select('first_name, last_name').eq('id', student_id))
+        student_resp = safe_execute(supabase.table('user_info').select('first_name, last_name').eq('id', student_id_int))
         student = student_resp.data[0] if student_resp.data else {}
         student_name = f"{student.get('first_name', '')} {student.get('last_name', '')}".strip()
 
         # Get reward info for log
-        reward_resp2 = safe_execute(supabase.table('rewards').select('reward_name').eq('reward_id', reward_id))
+        reward_resp2 = safe_execute(supabase.table('rewards').select('reward_name').eq('reward_id', reward_id_int))
         reward_name = reward_resp2.data[0]['reward_name'] if reward_resp2.data else ''
 
         safe_execute(supabase.table('admin_activity_log').insert({
-            'user_id': int(student_id),
+            'user_id': student_id_int,
             'user_role': 'Student',
             'action': 'Redeem Reward',
             'activity': 'Reward Redemption',
@@ -1820,7 +3011,7 @@ def redeem_reward():
         if teacher_id:
             safe_execute(supabase.table('notifications').insert({
                 'user_id': teacher_id,  # teacher/admin who created the reward
-                'sender_id': int(student_id),
+                'sender_id': student_id_int,
                 'title': 'Reward Redemption',
                 'message': f"{student_name} redeemed the reward '{reward_name}'. Please process the claim.",
                 'redemption_id': redemption_id,
@@ -1828,12 +3019,165 @@ def redeem_reward():
                 'status': 'Unread',
             }))
 
-        return jsonify({'success': True, 'message': 'Reward redeemed successfully', 'new_points': new_points}), 200
+        # ✅ Calculate updated remaining redeems AFTER this redemption
+        # Previous count + 1 (this redemption) = new total used
+        updated_redemption_count = redemption_count + 1
+        updated_remaining_redeems = max(0, 3 - updated_redemption_count)
+        
+        print(f"[REDEEM_SUCCESS] Updated counts - total_used={updated_redemption_count}, remaining={updated_remaining_redeems}")
+
+        return jsonify({
+            'success': True, 
+            'message': 'Reward redeemed successfully', 
+            'new_points': new_points,
+            'remaining_redeems': updated_remaining_redeems,  # ✅ Send updated count after this redeem
+            'redemption_count': updated_redemption_count     # ✅ Send total redeemed including this one
+        }), 200
 
     except Exception as e:
-        print(f"Error redeeming reward: {e}")
+        import traceback
+        print(f"[REDEEM] ❌ Error redeeming reward: {e}")
+        print(f"[REDEEM] Exception type: {type(e).__name__}")
+        print(f"[REDEEM] Traceback: {traceback.format_exc()}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+
+
+
+
+# ✅ HELPER FUNCTION: Check if student can redeem a reward (quarterly limit)
+def check_can_redeem_reward(student_id, reward_id):
+    """
+    Check if student can redeem a reward based on quarterly limit.
+    Counts from reward_redemptions table manually.
+    Returns: {
+        'can_redeem': bool,
+        'count': int (times redeemed this quarter),
+        'remaining': int (remaining redeems),
+        'quarter_name': str
+    }
+    """
+    try:
+        # Get current quarter
+        today = datetime.now().date()
+        print(f"[CHECK_REDEEM] Today's date: {today}")
+        
+        quarter_resp = safe_execute(
+            supabase.table('quarters')
+            .select('quarter_name, start_date, end_date')
+        )
+        
+        current_quarter = None
+        quarter_name = 'Unknown'
+        quarter_id = None
+        
+        print(f"[CHECK_REDEEM] Found {len(quarter_resp.data) if quarter_resp.data else 0} quarters in DB")
+        
+        # ✅ Line 450-455: Kinukumpara ang TODAY sa quarter start/end dates
+        if quarter_resp.data:
+            for q in quarter_resp.data:
+                try:
+                    start_date_part = parser.parse(q['start_date']).date()
+                    end_date_part = parser.parse(q['end_date']).date()
+                    now_date = today
+                    
+                    print(f"[CHECK_REDEEM] Checking quarter: {q.get('quarter_name')} ({start_date_part} to {end_date_part})")
+                    
+                    # ✅ If today falls within this quarter's date range
+                    if start_date_part <= now_date <= end_date_part:
+                        current_quarter = q
+                        quarter_id = q.get('id')
+                        quarter_name = q.get('quarter_name', 'Unknown')
+                        print(f"[CHECK_REDEEM] ✅ Current quarter found: {quarter_name} (ID: {quarter_id})")
+                        break
+                except Exception as e:
+                    print(f"[CHECK_REDEEM] Error parsing dates: {e}")
+                    pass
+        
+        if not current_quarter:
+            print(f"[CHECK_REDEEM] ⚠️ No active quarter found - returning default (3 remaining)")
+            return {
+                'can_redeem': True,
+                'count': 0,
+                'remaining': 3,
+                'quarter_id': None,
+                'quarter_name': 'No Quarter'
+            }
+        
+        # ✅ Line 475-480: Kinukuha ang start_date at end_date ng current quarter
+        quarter = current_quarter
+        start_date = quarter['start_date']    # Q1: Jan 1 (returns as ISO string from DB)
+        end_date = quarter['end_date']        # Q1: Mar 31 (returns as ISO string from DB)
+        
+        print(f"[CHECK_REDEEM] Quarter date range: {start_date} to {end_date}")
+        
+        # ✅ FIX: Extract date part only, then add full end-of-day timestamp
+        # If end_date has time component, remove it first
+        try:
+            # Parse the end_date to extract just the date part
+            end_date_parsed = parser.parse(end_date).date()
+            end_date_with_time = f"{end_date_parsed}T23:59:59"  # Date only + full end of day time
+            print(f"[CHECK_REDEEM] Adjusted end_date for query: {end_date_with_time}")
+        except Exception as e:
+            print(f"[CHECK_REDEEM] ⚠️ Error parsing end_date: {e}")
+            end_date_with_time = end_date
+        
+        # Hardcoded redemption limit - max 3 times per quarter
+        redemption_limit = 3
+        
+        # ✅ Line 489-496: Nag-count lang ng redemptions WITHIN date range using Supabase filters
+        print(f"\n[CHECK_REDEEM] === FETCHING REDEMPTIONS ===")
+        print(f"[CHECK_REDEEM] Looking for: student_id={student_id} (type: {type(student_id)}), reward_id={reward_id} (type: {type(reward_id)})")
+        
+        # Fetch redemptions within the quarter date range - using Supabase query filters for efficiency
+        redemption_resp = safe_execute(
+            supabase.table('reward_redemptions')
+            .select('redemption_id, processed_at')
+            .eq('student_id', student_id)
+            .eq('reward_id', reward_id)
+            .gte('processed_at', start_date)              # ✅ Start date filter
+            .lte('processed_at', end_date_with_time)      # ✅ End date filter (with full day)
+        )
+        
+        print(f"[CHECK_REDEEM] Query: student_id={student_id}, reward_id={reward_id}")
+        print(f"[CHECK_REDEEM] Date range: {start_date} to {end_date_with_time}")
+        print(f"[CHECK_REDEEM] Query returned: {len(redemption_resp.data) if redemption_resp.data else 0} redemptions")
+        
+        # ✅ Line 524: Ang CORE LOGIC para sa 3-limit
+        count = len(redemption_resp.data) if redemption_resp.data else 0
+        remaining = max(0, redemption_limit - count)
+        can_redeem = remaining > 0
+        
+        # Log each redemption for audit trail
+        if redemption_resp.data:
+            for idx, r in enumerate(redemption_resp.data):
+                processed_time = r.get('processed_at')
+                print(f"[CHECK_REDEEM] ✅ Redemption #{idx+1}: {processed_time}")
+        else:
+            print(f"[CHECK_REDEEM] ℹ️ No redemptions found for this student+reward combo")
+        
+        print(f"[CHECK_REDEEM] Final result: count={count}, remaining={remaining}, can_redeem={can_redeem}, quarter={quarter_name}")
+        print(f"[CHECK_REDEEM] ===============================================\n")
+        
+        return {
+            'can_redeem': can_redeem,      # ✅ True kung may natitira pa
+            'count': count,                # ✅ Ilan na na-redeem (0-3)
+            'remaining': remaining,        # ✅ Ilan pa pwedeng i-redeem (3-X)
+            'quarter_id': quarter_id,
+            'quarter_name': quarter_name
+        }
     
+    except Exception as e:
+        print(f"[CHECK_REDEEM] ❌ EXCEPTION: {str(e)}")
+        app.logger.error(f"Error checking redemption limit: {str(e)}")
+        return {
+            'can_redeem': True,
+            'count': 0,
+            'remaining': 3,
+            'quarter_name': 'Error'
+        }
+
+
 
 # --- GET REWARD REDEMPTIONS HISTORY ROUTE ---
 @app.route('/reward_redemptions', methods=['GET'])
@@ -1847,17 +3191,18 @@ def get_reward_redemptions():
         return jsonify({'success': False, 'error': 'Missing student_id'}), 400
 
     try:
-        # Join reward_redemptions with rewards table to get reward details
-        resp = safe_execute(supabase.table('reward_redemptions') \
-            .select('redemption_id, reward_id, points_deducted, processed_at, teacher_id, status, notes, used_at, rewards(reward_name, description, category, point_cost, created_by)')
-            .eq('student_id', student_id) \
-            .order('processed_at', desc=True))
+        # Join reward_redemptions with rewards table to get reward details, including notes and remarks
+        resp = safe_execute(
+            supabase.table('reward_redemptions')
+            .select('redemption_id, reward_id, points_deducted, processed_at, teacher_id, status, notes, remarks, used_at, rewards(reward_name, description, category, point_cost, created_by)')
+            .eq('student_id', student_id)
+            .order('processed_at', desc=True)
+        )
         redemptions = resp.data if resp.data else []
 
-        # For each redemption, get teacher name, subject, and profile picture
+        # For each redemption, get teacher info and always include notes and remarks
         for r in redemptions:
             teacher_id = None
-            # Try from reward's created_by first
             if r.get('rewards') and r['rewards'].get('created_by'):
                 teacher_id = r['rewards']['created_by']
             elif r.get('teacher_id'):
@@ -1889,12 +3234,29 @@ def get_reward_redemptions():
             r['teacher_subject'] = teacher_subject
             r['teacher_profile_picture'] = teacher_profile_picture
 
+            # Always include both notes (teacher) and remarks (student)
+            r['notes'] = r.get('notes', '') or ''
+            r['remarks'] = r.get('remarks', '') or ''
+
         return jsonify({'success': True, 'redemptions': redemptions}), 200
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
-    
+
 
     
+# ====================================================================================================
+#                                         STUDENT REWARDS PAGE END
+# ====================================================================================================
+
+
+
+
+# ====================================================================================================
+#                                         STUDENT LEADERBOARDS PAGE START
+# ====================================================================================================
+
+
+
 
 # --- GET LEADERBOARD BY SECTION ROUTE ---
 @app.route('/leaderboard', methods=['GET'])
@@ -2020,6 +3382,7 @@ def get_current_school_year():
             return q['school_year']
     return None
 
+
 # --- GET CURRENT QUARTER LEADERBOARD BY SECTION ROUTE ---
 @app.route('/current_quarter', methods=['GET'])
 def get_current_quarter():
@@ -2040,6 +3403,8 @@ def get_current_quarter():
                 'end_date': end_iso
             }), 200
     return jsonify({'error': 'No current quarter found'}), 404
+
+
 
 # --- GET ALL TIME POINTS KADA QUARTER LEADERBOARD BY SECTION ROUTE ---
 @app.route('/quarter_points', methods=['GET'])
@@ -2151,7 +3516,8 @@ def get_quarter_points():
     }), 200
 
 
-# --- GET ACTIVITIES COMPLETED COUNT ROUTE SA LEADERBOARDS PAGE ---
+
+# --- GET ACTIVITIES COMPLETED COUNT ROUTE ETO YUNG SA MY PROGRESS DIALOG SA LEADERBOARDS PAGE ---
 @app.route('/activities_completed', methods=['GET'])
 def activities_completed():
     user_id = request.args.get('user_id')
@@ -2245,7 +3611,7 @@ def activities_completed():
     return jsonify({'count': count}), 200
 
 
-# --- WEEKLY POINTS ROUTE SA LEADERBIARD PAFE---
+# --- WEEKLY POINTS ROUTE SA LEADERBOARD PAGE---
 @app.route('/weekly_points', methods=['GET'])
 def weekly_points():
     user_id = request.args.get('user_id')
@@ -2304,6 +3670,20 @@ def weekly_points():
                 continue
 
     return jsonify({'points': points_per_day}), 200
+
+
+
+
+# ====================================================================================================
+#                                         STUDENT LEADERBOARD PAGE END
+# ====================================================================================================
+
+
+
+# ====================================================================================================
+#                                         STUDENT PROFILE PAGE START
+# ====================================================================================================
+
 
 
 # --- PROFILE PAGE ROUTE ---
@@ -2371,7 +3751,7 @@ def upload_profile_picture():
     if hasattr(storage_resp, 'error') and storage_resp.error is not None:
         return jsonify({'error': str(storage_resp.error)}), 500
 
-    public_url = f"https://bdcmzatfoaocnsfdpudv.supabase.co/storage/v1/object/public/profile-pictures/{filename}"
+    public_url = f"https://myetrhrskmbwnmmmxdzt.supabase.co/storage/v1/object/public/profile-pictures/{filename}"
 
     # Check if user already has a profile picture
     existing = safe_execute(supabase.table('profile_pictures').select('pic_id').eq('user_id', user_id))
@@ -2414,6 +3794,7 @@ def upload_profile_picture():
     return jsonify({'success': True, 'profile_picture': public_url}), 200
 
 
+# --- GET RECENT PROFILE PICTURES (HISTORY) ---
 @app.route('/recent_profile_pictures', methods=['GET'])
 def recent_profile_pictures():
     user_id = request.args.get('user_id')
@@ -2422,25 +3803,34 @@ def recent_profile_pictures():
         return jsonify({'error': 'Missing user_id'}), 400
 
     try:
+        # Convert to int for consistency with database
+        user_id_int = int(user_id)
+        
         resp = safe_execute(
             supabase.table('profile_picture_history')
-            .select('file_path')
-            .eq('user_id', user_id)
+            .select('file_path, uploaded_at')
+            .eq('user_id', user_id_int)
             .order('uploaded_at', desc=True)
             .limit(6)
         )
         
         if resp.data:
+            # Return just the file paths in order
             pics = [r['file_path'] for r in resp.data]
+            print(f"📸 Recent avatars for user {user_id_int}: {len(pics)} found")
         else:
             pics = []
+            print(f"⚠️ No profile picture history found for user {user_id_int}")
         
-        return jsonify({'recent_pictures': pics}), 200
+        return jsonify({'recent_pictures': pics, 'count': len(pics)}), 200
         
+    except ValueError:
+        return jsonify({'error': 'Invalid user_id format'}), 400
     except Exception as e:
-        return jsonify({'error': 'Internal server error'}), 500
+        print(f"❌ Error fetching recent pictures: {str(e)}")
+        return jsonify({'error': 'Failed to fetch recent pictures', 'details': str(e)}), 500
 
-
+# --- SET FROM HISTORY (REVERT TO PREVIOUS AVATAR) ---
 @app.route('/set_profile_picture_from_history', methods=['POST'])
 def set_profile_picture_from_history():
     data = request.get_json()
@@ -2535,6 +3925,18 @@ def delete_profile_picture():
 
 
 
+# ====================================================================================================
+#                                         STUDENT PROFILE PAGE END
+# ====================================================================================================
+
+
+
+
+
+# ====================================================================================================
+#                                        STUDENT PERSONAL INFO PAGE START
+# ====================================================================================================
+
 # ---PAG DISPLAY NG INFO NI STUDENTS PERSONAL INFO PAGE ROUTE ---
 @app.route('/personal_info', methods=['GET'])
 def personal_info():
@@ -2602,6 +4004,20 @@ def update_profile_info():
     return jsonify({'success': True, 'changed_fields': [f.split(':')[0] for f in changed_fields]}), 200
 
 
+
+# ====================================================================================================
+#                                        STUDENT PERSONAL INFO PAGE END
+# ====================================================================================================
+
+
+
+
+
+
+# ====================================================================================================
+#                                        STUDENT CHANGE PASSWORD PAGE START
+# ====================================================================================================
+
 # --- PASSWORD CHANGE ROUTE ---
 @app.route('/change_password', methods=['POST'])
 def change_password():
@@ -2639,6 +4055,21 @@ def change_password():
 
     return jsonify({'success': True}), 200
 
+
+
+# ====================================================================================================
+#                                        STUDENT CHANGE PASSWORD PAGE END
+# ====================================================================================================
+
+
+
+
+
+
+
+# ====================================================================================================
+#                                        STUDENT PARENT INFORMATION PAGE START
+# ====================================================================================================
 
 # --- PAGDISPLAY NG INFO NI STUDENTS SA PARENT PAGE ROUTE ---
 @app.route('/parent_info', methods=['GET'])
@@ -2719,6 +4150,22 @@ def add_parent_info():
         return jsonify({'error': f'Insert/Update error: {str(e)}'}), 500
 
 
+
+# ====================================================================================================
+#                                        STUDENT PARENT INFORMATION PAGE END
+# ====================================================================================================
+
+
+
+
+
+
+
+# ====================================================================================================
+#                                        STUDENT NOTIFICATION PAGE START
+# ====================================================================================================
+
+
 # --- NOTIFICATIONS ROUTE ---
 @app.route('/notifications', methods=['GET'])
 def get_notifications():
@@ -2789,6 +4236,11 @@ def mark_all_notifications_read():
     safe_execute(supabase.table('notifications').update({'status': 'Read'}).eq('user_id', user_id))
     return jsonify({'success': True}), 200
 
+
+
+# ====================================================================================================
+#                                        STUDENT NOTIFICATION PAGE END
+# ====================================================================================================
 
 
 # --- LOGOUT ROUTE ---
@@ -2876,11 +4328,24 @@ def logout():
 
 
 
-# --- END OF AN ERA FOR STUDENTS ---
+# ====================================================================================================
+#                                        STUDENT LOGOUT AND ACTIVITY LOGGING END
+# ====================================================================================================
 
 
 
-# --- START FOR NEW GENERATION TEACHER ---
+
+
+
+
+
+
+
+
+
+# ====================================================================================================
+#                                        TEACHER SIDE START
+# ====================================================================================================
 
 
 # ✅ ADD THIS LIGHTWEIGHT ENDPOINT FOR LOGIN VERIFICATION
@@ -2920,7 +4385,12 @@ def verify_teacher_account():
         return jsonify({'error': str(e)}), 500
 
 
-# --- TEACHER DASHBOARD ROUTE ---
+
+# ====================================================================================================
+#                                        TEACHER DASHBOARD PAGE START
+# ====================================================================================================
+
+
 # --- TEACHER DASHBOARD ROUTE ---
 @app.route('/teacher_dashboard', methods=['GET'])
 def get_teacher_dashboard():
@@ -3164,7 +4634,7 @@ def get_teacher_dashboard():
             'error': 'Server error',
             'message': 'Unable to load dashboard data'
         }), 500
-######################### TEACHER DASHBOARD ENDS ###############################################
+
 
 
 @app.route('/teacher_notifications', methods=['GET'])
@@ -3318,7 +4788,20 @@ def mark_teacher_notifications_read():
         return jsonify({'success': False, 'message': str(e)}), 500
 
 
+# ====================================================================================================
+#                                        TEACHER DASHBOARD PAGE END
+# ====================================================================================================
 
+
+
+
+
+
+
+
+# ====================================================================================================
+#                                        TEACHER STUDENT PAGE START
+# ====================================================================================================
 
 
 # --- TEACHER STUDENTS/ PAG DISPLAY PAGE ROUTE ---
@@ -3428,685 +4911,17 @@ def api_student_list():
         print(f"Error in api_student_list: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
-@app.route('/api/class-summary', methods=['GET'])
-def api_class_summary():
-    teacher_id = request.args.get('user_id') or session.get('user_id')
-    if not teacher_id:
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
 
-    try:
-        # 1. Get all classrooms assigned to this teacher
-        assignments_result = safe_execute(
-            supabase.table('teacher_class_assignments')
-            .select('grade_level, section')
-            .eq('teacher_id', teacher_id)
-        )
-        assignments = assignments_result.data if assignments_result.data else []
-
-        # 2. Get all students in these classrooms
-        students = []
-        for assignment in assignments:
-            grade_level = assignment.get('grade_level')
-            section = assignment.get('section')
-            if not grade_level or not section:
-                continue
-            student_result = safe_execute(
-                supabase.table('user_info')
-                .select('id, first_name, last_name, year_level, section')
-                .eq('role', 'Student')
-                .eq('year_level', grade_level)
-                .eq('section', section)
-                .eq('status', 'Active')
-            )
-            if student_result.data:
-                students.extend(student_result.data)
-
-        # Remove duplicates
-        unique_students = {student['id']: student for student in students}.values()
-        student_ids = [student['id'] for student in unique_students]
-
-        # Get profile pictures
-        pics_map = {}
-        if student_ids:
-            pics_result = safe_execute(
-                supabase.table('profile_pictures')
-                .select('user_id', 'file_path')
-                .in_('user_id', student_ids)
-            )
-            if pics_result.data:
-                for pic in pics_result.data:
-                    pics_map[pic['user_id']] = pic['file_path']
-
-        # Get total points for each student - FILTERED BY THIS TEACHER
-        points_map = {}
-        if student_ids:
-            points_result = safe_execute(
-                supabase.table('points')
-                .select('student_id', 'points')
-                .eq('teacher_id', teacher_id)
-                .in_('student_id', student_ids)
-            )
-            if points_result.data:
-                for row in points_result.data:
-                    sid = row['student_id']
-                    points_map[sid] = points_map.get(sid, 0) + row['points']
-
-        # Prepare summary data
-        student_list = []
-        total_points = 0
-        for student in unique_students:
-            pic = pics_map.get(student['id'], '')
-            points = points_map.get(student['id'], 0)
-            total_points += points
-            student_list.append({
-                'id': student['id'],
-                'name': f"{student['first_name']} {student['last_name']}",
-                'grade': student['year_level'],
-                'section': student['section'],
-                'points': points,
-                'profile_picture': pic,
-            })
-
-        # Sort by points descending
-        student_list.sort(key=lambda x: x['points'], reverse=True)
-        top_students = student_list[:5]
-        avg_points = total_points / len(student_list) if student_list else 0
-
-        # Participation calculation
-        from datetime import datetime, timedelta, timezone
-        now = datetime.now(timezone.utc)
-        week_ago = now - timedelta(days=7)
-        two_weeks_ago = now - timedelta(days=14)
-
-        participation = {
-            'this_week': 0,
-            'last_week': 0,
-            'this_month': 0,
-            'last_month': 0
-        }
-
-        # Count points using rolling periods
-        if student_ids:
-            # Get all points from last 2 weeks
-            points_result = safe_execute(
-                supabase.table('points')
-                .select('student_id', 'received_at')
-                .eq('teacher_id', teacher_id)
-                .in_('student_id', student_ids)
-                .gte('received_at', two_weeks_ago.isoformat())
-            )
-            if points_result.data:
-                for row in points_result.data:
-                    received_at = row['received_at']
-                    try:
-                        dt = datetime.fromisoformat(str(received_at).replace('Z', '+00:00'))
-                    except Exception:
-                        continue
-                    if dt >= week_ago:
-                        participation['this_week'] += 1
-                    elif dt >= two_weeks_ago:
-                        participation['last_week'] += 1
-
-        # Month calculations (calendar months)
-        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        last_month = (start_of_month - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-        if student_ids:
-            points_month = safe_execute(
-                supabase.table('points')
-                .select('student_id', 'received_at')
-                .eq('teacher_id', teacher_id)
-                .in_('student_id', student_ids)
-                .gte('received_at', start_of_month.isoformat())
-            )
-            participation['this_month'] = len(points_month.data) if points_month.data else 0
-
-            points_last_month = safe_execute(
-                supabase.table('points')
-                .select('student_id', 'received_at')
-                .eq('teacher_id', teacher_id)
-                .in_('student_id', student_ids)
-                .gte('received_at', last_month.isoformat())
-                .lt('received_at', start_of_month.isoformat())
-            )
-            participation['last_month'] = len(points_last_month.data) if points_last_month.data else 0
-
-        # Calculate percentages
-        week_increase = 0
-        if participation['last_week'] > 0:
-            week_increase = min(round((participation['this_week'] - participation['last_week']) / participation['last_week'] * 100, 1), 100)
-        elif participation['this_week'] > 0:
-            week_increase = 100.0
-
-        month_increase = 0
-        if participation['last_month'] > 0:
-            month_increase = min(round((participation['this_month'] - participation['last_month']) / participation['last_month'] * 100, 1), 100)
-        elif participation['this_month'] > 0:
-            month_increase = 100.0
-
-        # Add week_increase to each top student
-        for stu in top_students:
-            stu['week_increase'] = round(week_increase, 1)
-
-        return jsonify({
-            'success': True,
-            'class_summary': {
-                'total_students': len(student_list),
-                'average_points': round(avg_points, 2),
-                'top_students': top_students,
-                'participation': {
-                    'this_week': participation['this_week'],
-                    'last_week': participation['last_week'],
-                    'week_increase': round(week_increase, 1),
-                    'this_month': participation['this_month'],
-                    'last_month': participation['last_month'],
-                    'month_increase': round(month_increase, 1)
-                }
-            }
-        }), 200
-    except Exception as e:
-        return jsonify({'success': False, 'message': str(e)}), 500
-
-# --- EXPORT STUDENT SUMMARY TO EXCEL ROUTE --- 
-@app.route('/export_student_summary', methods=['POST'])
-def export_student_summary():
-    """Export filtered student data to Excel with professional formatting"""
-    try:
-        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-        from openpyxl.utils import get_column_letter
-        if pd is None:
-            return jsonify({'success': False, 'error': 'pandas not available'}), 500
-
-        data = request.get_json() or {}
-        teacher_id = data.get('teacher_id')
-        filters = data.get('filters') or {}
-
-        # Fetch students
-        response = requests.get(
-            f'{request.host_url.rstrip("/")}/students?user_id={teacher_id}'
-        )
-        if response.status_code != 200:
-            return jsonify({'success': False, 'error': 'Failed to fetch students'}), 500
-
-        data_resp = response.json()
-        students = data_resp.get('students', [])
-
-        # Apply filters
-        search_q = filters.get('search', '').lower()
-        classroom = filters.get('classroom')
-        
-        if search_q:
-            students = [s for s in students if search_q in s.get('name', '').lower()]
-        if classroom and classroom != 'Grade & Section':
-            students = [s for s in students if f"Grade {s.get('grade')} - {s.get('section')}" == classroom]
-
-        # Prepare Excel data - ✅ MATCHING EXACT FORMAT FROM IMAGE
-        excel_data = []
-        for s in students:
-            excel_data.append({
-                'Name': s.get('name', ''),
-                'Grade': s.get('grade', ''),
-                'Section': s.get('section', ''),
-                'Points': s.get('points', 0),
-                'Rewards Redeemed': s.get('redeemed_rewards', 0),
-                'Last Activity': s.get('last_activity', 'N/A'),
-                'Participation (%)': f"{s.get('participation_percent', 0):.1f}",
-            })
-
-        df = pd.DataFrame(excel_data)
-
-        # Create Excel with professional formatting - ✅ EXACT FORMAT FROM IMAGE
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            # Write data starting at row 6 (to leave space for header info)
-            df.to_excel(writer, sheet_name='Students', index=False, startrow=5)
-            
-            ws = writer.sheets['Students']
-            
-            # ===== ROW 1: Learn2Earn Title (NO BACKGROUND) =====
-            ws['A1'] = 'Learn2Earn'
-            ws['A1'].font = Font(name='Calibri', size=11, bold=False, color='000000')  # ✅ CHANGED: bold=False
-            ws['A1'].fill = PatternFill()  # ✅ NO BACKGROUND COLOR
-            ws['A1'].alignment = Alignment(horizontal='left', vertical='center')
-            ws.row_dimensions[1].height = 28
-            ws.merge_cells('A1:G1')
-            
-            # ===== ROW 2: School Name (NO BACKGROUND COLOR) =====
-            ws['A2'] = 'Masico National High School'
-            ws['A2'].font = Font(name='Calibri', size=11, bold=False, color='000000')
-            ws['A2'].alignment = Alignment(horizontal='left', vertical='center')
-            ws.row_dimensions[2].height = 16
-            
-            # ===== ROW 3: Date and Time (NO COLOR) =====
-            now = datetime.now()
-            date_str = now.strftime('%B %d, %Y at %I:%M %p')
-            ws['A3'] = f'Student Report - {date_str}'
-            ws['A3'].font = Font(name='Calibri', size=10, color='000000')  # ✅ BLACK TEXT
-            ws['A3'].alignment = Alignment(horizontal='left', vertical='center')
-            ws.row_dimensions[3].height = 14
-            
-            # ===== ROW 4: Empty row for spacing =====
-            ws.row_dimensions[4].height = 8
-            
-            # ===== ROW 5: Empty row =====
-            ws.row_dimensions[5].height = 0
-            
-            # ===== ROW 6: Blue Header Row with Column Names =====
-            header_fill = PatternFill(start_color='7485E8', end_color='7485E8', fill_type='solid')  # ✅ CORRECT BLUE
-            header_font = Font(name='Calibri', size=11, bold=True, color='FFFFFF')
-            header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-            
-            thin_border = Border(
-                left=Side(style='thin', color='D9D9D9'),
-                right=Side(style='thin', color='D9D9D9'),
-                top=Side(style='thin', color='D9D9D9'),
-                bottom=Side(style='thin', color='D9D9D9')
-            )
-            
-            # ✅ Set header row formatting
-            for col_num, col_title in enumerate(['Name', 'Grade', 'Section', 'Points', 'Rewards Redeemed', 'Last Activity', 'Participation (%)'], 1):
-                cell = ws.cell(row=6, column=col_num)
-                cell.value = col_title
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = header_alignment
-                cell.border = thin_border
-            
-            ws.row_dimensions[6].height = 20
-            
-            # ===== DATA ROWS: Format student data =====
-            data_font = Font(name='Calibri', size=10, color='000000')
-            data_alignment_center = Alignment(horizontal='center', vertical='center')
-            data_alignment_left = Alignment(horizontal='left', vertical='center')
-            
-            for row in ws.iter_rows(min_row=7, max_row=ws.max_row, min_col=1, max_col=7):
-                for col_num, cell in enumerate(row, 1):
-                    cell.font = data_font
-                    cell.border = thin_border
-                    
-                    # ✅ Left align for Name and Last Activity
-                    if col_num in [1, 6]:
-                        cell.alignment = data_alignment_left
-                    else:
-                        cell.alignment = data_alignment_center
-                    
-                    # ✅ Format numbers
-                    if col_num in [4, 5]:  # Points, Rewards Redeemed
-                        if isinstance(cell.value, (int, float)):
-                            cell.number_format = '0'
-            
-            # ===== SET COLUMN WIDTHS - ✅ EXACT FROM IMAGE =====
-            ws.column_dimensions['A'].width = 20  # Name
-            ws.column_dimensions['B'].width = 8   # Grade
-            ws.column_dimensions['C'].width = 12  # Section
-            ws.column_dimensions['D'].width = 12  # Points
-            ws.column_dimensions['E'].width = 18  # Rewards Redeemed
-            ws.column_dimensions['F'].width = 28  # Last Activity
-            ws.column_dimensions['G'].width = 18  # Participation (%)
-
-        output.seek(0)
-        
-        # ✅ FILENAME FORMAT: Learn2Earn_Student_Report_2025-11-30
-        date_str = datetime.now().strftime('%Y-%m-%d')
-        filename = f"Learn2Earn_Student_Report_{date_str}.xlsx"
-
-        return send_file(
-            output,
-            as_attachment=True,
-            download_name=filename,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
-
-    except Exception as e:
-       
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-# --- SEND DISMISSAL FUNCTION IN STUDENT PAGE ROUTE ---
-# --- SEND DISMISSAL FUNCTION IN STUDENT PAGE ROUTE (UPDATED WITH SMS) ---
-@app.route('/send-dismissal', methods=['POST'])
-def send_dismissal():
-    data = request.get_json()
-    user_id = session.get('user_id') or data.get('user_id')
-    role = session.get('role') or data.get('role')
-    if not user_id or role != 'Teacher':
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
-
-    dismissal_time = data.get('dismissal_time')
-    message = data.get('message', '')
-    notify_email = data.get('notify_email')
-    notify_sms = data.get('notify_sms')  # ✅ NEW: SMS notification flag
-    grade = data.get('grade')
-    section = data.get('section')
-    student_id = data.get('student_id')
-    if student_id in [None, '', 'None']:
-        student_id = None
-
-    # If "All Grade Level" or "All Section" is selected, treat as None
-    if grade == 'All Grade Level':
-        grade = None
-    if section == 'All Section':
-        section = None
-
-    # ✅ Format time to AM/PM for display
-    dismissal_time_formatted = dismissal_time
-    try:
-        dt = None
-        try:
-            dt = datetime.strptime(dismissal_time, "%H:%M")
-        except Exception:
-            try:
-                dt = datetime.strptime(dismissal_time, "%I:%M %p")
-            except Exception:
-                dt = None
-        if dt:
-            dismissal_time_formatted = dt.strftime("%I:%M %p").lstrip("0")
-    except Exception:
-        dismissal_time_formatted = dismissal_time
-
-    # Query students: if no grade/section/student_id, get all students handled by teacher
-    students_query = supabase.table('user_info').select('id, first_name, last_name, year_level, section').eq('role', 'Student')
-    if student_id is not None:
-        students_query = students_query.eq('id', student_id)
-    elif grade or section:
-        if grade:
-            students_query = students_query.eq('year_level', grade)
-        if section:
-            students_query = students_query.eq('section', section)
-    else:
-        # Get all students handled by teacher
-        assignments = safe_execute(
-            supabase.table('teacher_class_assignments')
-            .select('grade_level', 'section')
-            .eq('teacher_id', user_id)
-        ).data or []
-        student_ids = set()
-        for a in assignments:
-            grade_level = a.get('grade_level')
-            section_val = a.get('section')
-            students_result = safe_execute(
-                supabase.table('user_info')
-                .select('id')
-                .eq('role', 'Student')
-                .eq('year_level', grade_level)
-                .eq('section', section_val)
-            )
-            if students_result and hasattr(students_result, 'data') and students_result.data:
-                for s in students_result.data:
-                    student_ids.add(s['id'])
-        students_query = supabase.table('user_info').select('id, first_name, last_name, year_level, section').in_('id', list(student_ids))
-
-    students_result = students_query.execute()
-    students = students_result.data if students_result.data else []
-
-    if not students:
-        return jsonify({'success': False, 'message': 'No students found.'}), 404
-
-    # ✅ Get teacher's name for notifications
-    teacher_info = supabase.table('user_info').select('first_name, last_name', 'gender').eq('id', user_id).execute()
-    teacher_name = ''
-    if teacher_info.data and len(teacher_info.data) > 0:
-        teacher_name = f"{teacher_info.data[0].get('first_name', '')} {teacher_info.data[0].get('last_name', '')}"
-
-    # Prepare student IDs as both string and int for parent lookup
-    student_ids_str = [str(s['id']).strip() for s in students]
-    student_ids_int = []
-    for sid in student_ids_str:
-        try:
-            student_ids_int.append(int(sid))
-        except ValueError:
-            pass
-
-    # Query parents table for emails and phone numbers
-    parents = []
-    try:
-        parents_result = supabase.table('parents').select('student_id, email, mobile_no, relationship, first_name, last_name').in_('student_id', student_ids_str).execute()
-        parents = parents_result.data if parents_result.data else []
-    except Exception as e:
-        print(f"DEBUG: String query failed: {e}")
-
-    if not parents and student_ids_int:
-        try:
-            parents_result = supabase.table('parents').select('student_id, email, mobile_no, relationship, first_name, last_name').in_('student_id', student_ids_int).execute()
-            parents = parents_result.data if parents_result.data else []
-        except Exception as e:
-            print(f"DEBUG: Integer query failed: {e}")
-
-    # Fallback: try individual queries for first 2 students if still no parents found
-    if not parents:
-        for student_id_str in student_ids_str[:2]:
-            try:
-                individual_result = supabase.table('parents').select('student_id, email, mobile_no, relationship, first_name, last_name').eq('student_id', student_id_str).execute()
-                individual_parents = individual_result.data if individual_result.data else []
-                if individual_parents:
-                    parents.extend(individual_parents)
-            except Exception as e:
-                print(f"DEBUG: Individual query for {student_id_str} failed: {e}")
-
-    # ✅ Map student_id to list of parent emails and phone numbers
-    parent_email_map = {}
-    parent_phone_map = {}
-    for p in parents:
-        sid = str(p['student_id']).strip()
-        
-        # Email mapping
-        if p.get('email') and p['email'].strip():
-            if sid not in parent_email_map:
-                parent_email_map[sid] = []
-            parent_email_map[sid].append({
-                'email': p['email'].strip(),
-                'name': f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
-                'relationship': p.get('relationship', 'Parent')
-            })
-        
-        # Phone mapping
-        if p.get('mobile_no') and p['mobile_no'].strip():
-            if sid not in parent_phone_map:
-                parent_phone_map[sid] = []
-            parent_phone_map[sid].append({
-                'phone': p['mobile_no'].strip(),
-                'name': f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
-                'relationship': p.get('relationship', 'Parent')
-            })
-
-    sent_count = 0
-    email_sent_count = 0
-    sms_sent_count = 0
-    students_without_parents = []
-    email_failures = []
-    sms_failures = []
-
-    # ✅ Build base message
-    base_message = "Dear Parent,\n\nThis is to inform you that your child, {student_name}, has been dismissed at {dismissal_time}.\n\nMasico National High School\nGrade: {grade} - Section: {section}"
-    
-    if message:
-        base_message += f"\n\nNote: {message}"
-    
-    base_message += f"\n\nThank you,\nLearn2Earn\nTeacher: {teacher_name}"
-
-    # ✅ SEND EMAIL NOTIFICATIONS
-    if notify_email:
-        for student in students:
-            sid = str(student['id']).strip()
-            parent_emails = parent_email_map.get(sid, [])
-            
-            if parent_emails:
-                student_name = f"{student['first_name']} {student['last_name']}"
-                grade_level = student.get('year_level', 'Unknown')
-                section_name = student.get('section', 'Unknown')
-                
-                email_body = base_message.format(
-                    student_name=student_name,
-                    dismissal_time=dismissal_time_formatted,
-                    grade=grade_level,
-                    section=section_name
-                )
-                
-                for parent in parent_emails:
-                    subject = "Dismissal Notification"
-                    msg = Message(subject, sender=app.config['MAIL_USERNAME'], recipients=[parent['email']])
-                    msg.body = email_body
-                    
-                    try:
-                        mail.send(msg)
-                        email_sent_count += 1
-                        sent_count += 1
-                    except Exception as e:
-                        app.logger.error(f"Failed to send dismissal email to {parent['email']}: {str(e)}")
-                        email_failures.append(f"{student_name} - {parent['name']} ({parent['email']})")
-            else:
-                student_name = f"{student['first_name']} {student['last_name']}"
-                if student_name not in students_without_parents:
-                    students_without_parents.append(student_name)
-
-    # ✅ SEND SMS NOTIFICATIONS
-    if notify_sms:
-        for student in students:
-            sid = str(student['id']).strip()
-            parent_phones = parent_phone_map.get(sid, [])
-            
-            if parent_phones:
-                student_name = f"{student['first_name']} {student['last_name']}"
-                grade_level = student.get('year_level', 'Unknown')
-                section_name = student.get('section', 'Unknown')
-                
-                sms_message = base_message.format(
-                    student_name=student_name,
-                    dismissal_time=dismissal_time_formatted,
-                    grade=grade_level,
-                    section=section_name
-                )
-                
-                for parent in parent_phones:
-                    parent_number = parent['phone']
-                    
-                    # ✅ Convert to +63 format if needed
-                    if parent_number and parent_number.startswith('0'):
-                        parent_number = '+63' + parent_number[1:]
-                    elif parent_number and not parent_number.startswith('+'):
-                        parent_number = '+63' + parent_number
-                    
-                    # ✅ Only send if we have a valid phone number
-                    if parent_number and len(parent_number) >= 12:
-                        sms_result = send_sms_via_api(parent_number, sms_message, student['id'])
-                        
-                        if sms_result['success']:
-                            sms_sent_count += 1
-                            sent_count += 1
-                        else:
-                            sms_failures.append(f"{student_name} - {parent['name']} ({parent_number}): {sms_result['error']}")
-                    else:
-                        sms_failures.append(f"{student_name} - {parent['name']}: Invalid phone number format")
-            else:
-                student_name = f"{student['first_name']} {student['last_name']}"
-                if student_name not in students_without_parents:
-                    students_without_parents.append(student_name)
-
-    # ✅ Build response message
-    response_parts = []
-    if notify_email:
-        response_parts.append(f'Emails sent: {email_sent_count}')
-    if notify_sms:
-        response_parts.append(f'SMS sent: {sms_sent_count}')
-    
-    response_message = 'Dismissal notification sent! ' + ' | '.join(response_parts) if response_parts else 'Dismissal notification sent!'
-    
-    if students_without_parents:
-        response_message += f' (Note: {len(students_without_parents)} students have no parent contact on file)'
-
-    # ✅ Build result data with all details
-    result_data = {
-        'success': True,
-        'sent_count': sent_count,
-        'email_sent_count': email_sent_count,
-        'sms_sent_count': sms_sent_count,
-        'message': response_message,
-        'students_without_contacts': students_without_parents
-    }
-    
-    if email_failures:
-        result_data['email_failures'] = email_failures
-    if sms_failures:
-        result_data['sms_failures'] = sms_failures
-
-    return jsonify(result_data)
-
-
-# ✅ SEND SMS VIA HTTPSMS API
-def send_sms_via_api(phone_number, message, student_id):
-    """Send SMS via HTTPSMS API"""
-    HTTPSMS_API_KEY = "uk_2ublvy1otAtb3S-BQa9KZfIywUgGh6cXqc5ONgJb-fBRs9s8HU7ODFqO32qBEm7H"
-    
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": HTTPSMS_API_KEY,
-        "Accept": "application/json"
-    }
-
-    payload = {
-        "content": message,
-        "from": "+639761271972",  # ✅ Your registered number
-        "to": phone_number
-    }
-
-    try:
-        response = requests.post(
-            "https://api.httpsms.com/v1/messages/send",
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-
-        # ✅ Save to Supabase SMS log
-        safe_execute(supabase.table('sms_messages').insert({
-            "phone_number": phone_number,
-            "message": message,
-            "status": "sent" if response.status_code == 200 else "failed",
-            "sent_at": datetime.now().isoformat(),
-            "student_id": student_id,
-            "message_type": "dismissal_notification",
-            "response_data": json.dumps({
-                "status_code": response.status_code,
-                "response": response.text[:500]  # Limit response text
-            })
-        }))
-
-        if response.status_code == 200:
-            return {"success": True, "message": "SMS sent successfully"}
-        else:
-            return {"success": False, "error": f"HTTP {response.status_code}"}
-            
-    except Exception as e:
-        # ✅ Log error to Supabase
-        try:
-            safe_execute(supabase.table('sms_messages').insert({
-                "phone_number": phone_number,
-                "message": message,
-                "status": "failed",
-                "sent_at": datetime.now().isoformat(),
-                "student_id": student_id,
-                "message_type": "dismissal_notification",
-                "response_data": json.dumps({"error": str(e)[:200]})
-            }))
-        except Exception as log_e:
-            print(f"Failed to log SMS error: {log_e}")
-        
-        return {"success": False, "error": str(e)[:100]}
-
-
-
-
-
-
-
-
-
-# Download required NLTK data
-nltk.download('vader_lexicon', quiet=True)
-nltk.download('words', quiet=True)
-
-# Load English word dictionary
-ENGLISH_WORDS = set(words.words())
+# NLTK data already downloaded via download_nltk_data.py - no need to download on startup
+# English word dictionary loaded lazily when needed
+ENGLISH_WORDS = None  # Loaded on first use via get_english_words()
+
+def get_english_words():
+    """Lazy-load English words dictionary"""
+    global ENGLISH_WORDS
+    if ENGLISH_WORDS is None:
+        ENGLISH_WORDS = get_nltk_words()
+    return ENGLISH_WORDS
 
 # Expanded content filtering lists with variations
 SEXUAL_TERMS = {
@@ -4280,7 +5095,7 @@ def is_valid_english_text(text):
         # Skip very short words and numbers
         if len(word) <= 2 or word.isdigit():
             continue
-        if word in ENGLISH_WORDS or word.endswith(('ing', 'ed', 'ly', 's', 'es')):
+        if word in get_english_words() or word.endswith(('ing', 'ed', 'ly', 's', 'es')):
             valid_word_count += 1
     
     # Calculate percentage of valid words (excluding short words)
@@ -4304,21 +5119,9 @@ def is_valid_english_text(text):
     
     return True, None
 
-def safe_execute(query):
-    """
-    Safely execute Supabase query with error handling
-    """
-    try:
-        result = query.execute()
-        if hasattr(result, 'error') and result.error:
-            raise Exception(f"Supabase error: {result.error}")
-        return result
-    except Exception as e:
-        raise Exception(f"Database operation failed: {str(e)}")
-
 class FeedbackAnalyzer:
     def __init__(self):
-        self.sia = SentimentIntensityAnalyzer()
+        self.sia = None  # Lazy-load on first use
         
         self.positive_messages = [
             "Fantastic work! Your teacher sees your effort paying off. Keep up this amazing momentum! 🌟",
@@ -4354,6 +5157,10 @@ class FeedbackAnalyzer:
         ]
     
     def analyze_sentiment(self, feedback):
+        # Lazy-load sentiment analyzer on first use
+        if self.sia is None:
+            self.sia = get_sentiment_analyzer()
+        
         scores = self.sia.polarity_scores(feedback)
         compound = scores['compound']
         
@@ -4413,7 +5220,7 @@ def mobile_analyze_feedback():
             if lang != 'en':
                 # Fallback: Check if most words are English
                 words_list = re.findall(r'\b[a-zA-Z]+\b', feedback)
-                english_words = sum(1 for word in words_list if word.lower() in ENGLISH_WORDS)
+                english_words = sum(1 for word in words_list if word.lower() in get_english_words())
                 if words_list and english_words / len(words_list) >= 0.5:
                     pass  # Accept as English
                 else:
@@ -4421,7 +5228,7 @@ def mobile_analyze_feedback():
         except LangDetectException as e:
             # Fallback: Check if most words are English
             words_list = re.findall(r'\b[a-zA-Z]+\b', feedback)
-            english_words = sum(1 for word in words_list if word.lower() in ENGLISH_WORDS)
+            english_words = sum(1 for word in words_list if word.lower() in get_english_words())
             if words_list and english_words / len(words_list) >= 0.5:
                 pass  # Accept as English
             else:
@@ -5007,20 +5814,9 @@ def mobile_health_check():
         'version': '1.0.0'
     })
 
-# Error handler for mobile
-@app.errorhandler(404)
-def mobile_not_found(error):
-    return jsonify({
-        'success': False,
-        'message': 'Endpoint not found'
-    }), 404
 
-@app.errorhandler(500)
-def mobile_server_error(error):
-    return jsonify({
-        'success': False,
-        'message': 'Internal server error'
-    }), 500
+
+
 
 # ============================================================================
 # ORIGINAL WEB ENDPOINTS (for backward compatibility)
@@ -5047,7 +5843,7 @@ def analyze():
         # Fallback: Check if most words are English
         words_list = re.findall(r'\b[a-zA-Z]+\b', feedback)
         if words_list:
-            english_words = sum(1 for word in words_list if word.lower() in ENGLISH_WORDS)
+            english_words = sum(1 for word in words_list if word.lower() in get_english_words())
             if english_words / len(words_list) < 0.5:
                 return jsonify({'error': 'Please enter feedback in English only.'}), 400
 
@@ -5108,6 +5904,676 @@ def api_nlp_notification():
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'message': str(e)}), 500
+    
+# --- DISPLAY CLASS SUMMARY IN SUMMARY SECTION --- 
+@app.route('/api/class-summary', methods=['GET'])
+def api_class_summary():
+    teacher_id = request.args.get('user_id') or session.get('user_id')
+    if not teacher_id:
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+
+    try:
+        # 1. Get all classrooms assigned to this teacher
+        assignments_result = safe_execute(
+            supabase.table('teacher_class_assignments')
+            .select('grade_level, section')
+            .eq('teacher_id', teacher_id)
+        )
+        assignments = assignments_result.data if assignments_result.data else []
+
+        # 2. Get all students in these classrooms
+        students = []
+        for assignment in assignments:
+            grade_level = assignment.get('grade_level')
+            section = assignment.get('section')
+            if not grade_level or not section:
+                continue
+            student_result = safe_execute(
+                supabase.table('user_info')
+                .select('id, first_name, last_name, year_level, section')
+                .eq('role', 'Student')
+                .eq('year_level', grade_level)
+                .eq('section', section)
+                .eq('status', 'Active')
+            )
+            if student_result.data:
+                students.extend(student_result.data)
+
+        # Remove duplicates
+        unique_students = {student['id']: student for student in students}.values()
+        student_ids = [student['id'] for student in unique_students]
+
+        # Get profile pictures
+        pics_map = {}
+        if student_ids:
+            pics_result = safe_execute(
+                supabase.table('profile_pictures')
+                .select('user_id', 'file_path')
+                .in_('user_id', student_ids)
+            )
+            if pics_result.data:
+                for pic in pics_result.data:
+                    pics_map[pic['user_id']] = pic['file_path']
+
+        # Get total points for each student - FILTERED BY THIS TEACHER
+        points_map = {}
+        if student_ids:
+            points_result = safe_execute(
+                supabase.table('points')
+                .select('student_id', 'points')
+                .eq('teacher_id', teacher_id)
+                .in_('student_id', student_ids)
+            )
+            if points_result.data:
+                for row in points_result.data:
+                    sid = row['student_id']
+                    points_map[sid] = points_map.get(sid, 0) + row['points']
+
+        # Prepare summary data
+        student_list = []
+        total_points = 0
+        for student in unique_students:
+            pic = pics_map.get(student['id'], '')
+            points = points_map.get(student['id'], 0)
+            total_points += points
+            student_list.append({
+                'id': student['id'],
+                'name': f"{student['first_name']} {student['last_name']}",
+                'grade': student['year_level'],
+                'section': student['section'],
+                'points': points,
+                'profile_picture': pic,
+            })
+
+        # Sort by points descending
+        student_list.sort(key=lambda x: x['points'], reverse=True)
+        top_students = student_list[:5]
+        avg_points = total_points / len(student_list) if student_list else 0
+
+        # Participation calculation
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        week_ago = now - timedelta(days=7)
+        two_weeks_ago = now - timedelta(days=14)
+
+        participation = {
+            'this_week': 0,
+            'last_week': 0,
+            'this_month': 0,
+            'last_month': 0
+        }
+
+        # Count points using rolling periods
+        if student_ids:
+            # Get all points from last 2 weeks
+            points_result = safe_execute(
+                supabase.table('points')
+                .select('student_id', 'received_at')
+                .eq('teacher_id', teacher_id)
+                .in_('student_id', student_ids)
+                .gte('received_at', two_weeks_ago.isoformat())
+            )
+            if points_result.data:
+                for row in points_result.data:
+                    received_at = row['received_at']
+                    try:
+                        dt = datetime.fromisoformat(str(received_at).replace('Z', '+00:00'))
+                    except Exception:
+                        continue
+                    if dt >= week_ago:
+                        participation['this_week'] += 1
+                    elif dt >= two_weeks_ago:
+                        participation['last_week'] += 1
+
+        # Month calculations (calendar months)
+        start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        last_month = (start_of_month - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        if student_ids:
+            points_month = safe_execute(
+                supabase.table('points')
+                .select('student_id', 'received_at')
+                .eq('teacher_id', teacher_id)
+                .in_('student_id', student_ids)
+                .gte('received_at', start_of_month.isoformat())
+            )
+            participation['this_month'] = len(points_month.data) if points_month.data else 0
+
+            points_last_month = safe_execute(
+                supabase.table('points')
+                .select('student_id', 'received_at')
+                .eq('teacher_id', teacher_id)
+                .in_('student_id', student_ids)
+                .gte('received_at', last_month.isoformat())
+                .lt('received_at', start_of_month.isoformat())
+            )
+            participation['last_month'] = len(points_last_month.data) if points_last_month.data else 0
+
+        # Calculate percentages
+        week_increase = 0
+        if participation['last_week'] > 0:
+            week_increase = min(round((participation['this_week'] - participation['last_week']) / participation['last_week'] * 100, 1), 100)
+        elif participation['this_week'] > 0:
+            week_increase = 100.0
+
+        month_increase = 0
+        if participation['last_month'] > 0:
+            month_increase = min(round((participation['this_month'] - participation['last_month']) / participation['last_month'] * 100, 1), 100)
+        elif participation['this_month'] > 0:
+            month_increase = 100.0
+
+        # Add week_increase to each top student
+        for stu in top_students:
+            stu['week_increase'] = round(week_increase, 1)
+
+        return jsonify({
+            'success': True,
+            'class_summary': {
+                'total_students': len(student_list),
+                'average_points': round(avg_points, 2),
+                'top_students': top_students,
+                'participation': {
+                    'this_week': participation['this_week'],
+                    'last_week': participation['last_week'],
+                    'week_increase': round(week_increase, 1),
+                    'this_month': participation['this_month'],
+                    'last_month': participation['last_month'],
+                    'month_increase': round(month_increase, 1)
+                }
+            }
+        }), 200
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+# --- EXPORT STUDENT SUMMARY TO EXCEL ROUTE --- 
+@app.route('/export_student_summary', methods=['POST'])
+def export_student_summary():
+    """Export filtered student data to Excel with professional formatting"""
+    try:
+        import pandas as pd
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        data = request.get_json() or {}
+        teacher_id = data.get('teacher_id')
+        filters = data.get('filters') or {}
+
+        # Fetch students
+        response = requests.get(
+            f'{request.host_url.rstrip("/")}/students?user_id={teacher_id}'
+        )
+        if response.status_code != 200:
+            return jsonify({'success': False, 'error': 'Failed to fetch students'}), 500
+
+        data_resp = response.json()
+        students = data_resp.get('students', [])
+
+        # Apply filters
+        search_q = filters.get('search', '').lower()
+        classroom = filters.get('classroom')
+        
+        if search_q:
+            students = [s for s in students if search_q in s.get('name', '').lower()]
+        if classroom and classroom != 'Grade & Section':
+            students = [s for s in students if f"Grade {s.get('grade')} - {s.get('section')}" == classroom]
+
+        # Prepare Excel data - ✅ MATCHING EXACT FORMAT FROM IMAGE
+        excel_data = []
+        for s in students:
+            excel_data.append({
+                'Name': s.get('name', ''),
+                'Grade': s.get('grade', ''),
+                'Section': s.get('section', ''),
+                'Points': s.get('points', 0),
+                'Rewards Redeemed': s.get('redeemed_rewards', 0),
+                'Last Activity': s.get('last_activity', 'N/A'),
+                'Participation (%)': f"{s.get('participation_percent', 0):.1f}",
+            })
+
+        df = pd.DataFrame(excel_data)
+
+        # Create Excel with professional formatting - ✅ EXACT FORMAT FROM IMAGE
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # Write data starting at row 6 (to leave space for header info)
+            df.to_excel(writer, sheet_name='Students', index=False, startrow=5)
+            
+            ws = writer.sheets['Students']
+            
+            # ===== ROW 1: Learn2Earn Title (NO BACKGROUND) =====
+            ws['A1'] = 'Learn2Earn'
+            ws['A1'].font = Font(name='Calibri', size=11, bold=False, color='000000')  # ✅ CHANGED: bold=False
+            ws['A1'].fill = PatternFill()  # ✅ NO BACKGROUND COLOR
+            ws['A1'].alignment = Alignment(horizontal='left', vertical='center')
+            ws.row_dimensions[1].height = 28
+            ws.merge_cells('A1:G1')
+            
+            # ===== ROW 2: School Name (NO BACKGROUND COLOR) =====
+            ws['A2'] = 'Masico National High School'
+            ws['A2'].font = Font(name='Calibri', size=11, bold=False, color='000000')
+            ws['A2'].alignment = Alignment(horizontal='left', vertical='center')
+            ws.row_dimensions[2].height = 16
+            
+            # ===== ROW 3: Date and Time (NO COLOR) =====
+            now = datetime.now()
+            date_str = now.strftime('%B %d, %Y at %I:%M %p')
+            ws['A3'] = f'Student Report - {date_str}'
+            ws['A3'].font = Font(name='Calibri', size=10, color='000000')  # ✅ BLACK TEXT
+            ws['A3'].alignment = Alignment(horizontal='left', vertical='center')
+            ws.row_dimensions[3].height = 14
+            
+            # ===== ROW 4: Empty row for spacing =====
+            ws.row_dimensions[4].height = 8
+            
+            # ===== ROW 5: Empty row =====
+            ws.row_dimensions[5].height = 0
+            
+            # ===== ROW 6: Blue Header Row with Column Names =====
+            header_fill = PatternFill(start_color='7485E8', end_color='7485E8', fill_type='solid')  # ✅ CORRECT BLUE
+            header_font = Font(name='Calibri', size=11, bold=True, color='FFFFFF')
+            header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            
+            thin_border = Border(
+                left=Side(style='thin', color='D9D9D9'),
+                right=Side(style='thin', color='D9D9D9'),
+                top=Side(style='thin', color='D9D9D9'),
+                bottom=Side(style='thin', color='D9D9D9')
+            )
+            
+            # ✅ Set header row formatting
+            for col_num, col_title in enumerate(['Name', 'Grade', 'Section', 'Points', 'Rewards Redeemed', 'Last Activity', 'Participation (%)'], 1):
+                cell = ws.cell(row=6, column=col_num)
+                cell.value = col_title
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = header_alignment
+                cell.border = thin_border
+            
+            ws.row_dimensions[6].height = 20
+            
+            # ===== DATA ROWS: Format student data =====
+            data_font = Font(name='Calibri', size=10, color='000000')
+            data_alignment_center = Alignment(horizontal='center', vertical='center')
+            data_alignment_left = Alignment(horizontal='left', vertical='center')
+            
+            for row in ws.iter_rows(min_row=7, max_row=ws.max_row, min_col=1, max_col=7):
+                for col_num, cell in enumerate(row, 1):
+                    cell.font = data_font
+                    cell.border = thin_border
+                    
+                    # ✅ Left align for Name and Last Activity
+                    if col_num in [1, 6]:
+                        cell.alignment = data_alignment_left
+                    else:
+                        cell.alignment = data_alignment_center
+                    
+                    # ✅ Format numbers
+                    if col_num in [4, 5]:  # Points, Rewards Redeemed
+                        if isinstance(cell.value, (int, float)):
+                            cell.number_format = '0'
+            
+            # ===== SET COLUMN WIDTHS - ✅ EXACT FROM IMAGE =====
+            ws.column_dimensions['A'].width = 20  # Name
+            ws.column_dimensions['B'].width = 8   # Grade
+            ws.column_dimensions['C'].width = 12  # Section
+            ws.column_dimensions['D'].width = 12  # Points
+            ws.column_dimensions['E'].width = 18  # Rewards Redeemed
+            ws.column_dimensions['F'].width = 28  # Last Activity
+            ws.column_dimensions['G'].width = 18  # Participation (%)
+
+        output.seek(0)
+        
+        # ✅ FILENAME FORMAT: Learn2Earn_Student_Report_2025-11-30
+        date_str = datetime.now().strftime('%Y-%m-%d')
+        filename = f"Learn2Earn_Student_Report_{date_str}.xlsx"
+
+        return send_file(
+            output,
+            as_attachment=True,
+            download_name=filename,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+
+    except Exception as e:
+       
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+
+# --- SEND DISMISSAL FUNCTION IN STUDENT PAGE ROUTE (UPDATED WITH SMS) ---
+@app.route('/send-dismissal', methods=['POST'])
+def send_dismissal():
+    data = request.get_json()
+    user_id = session.get('user_id') or data.get('user_id')
+    role = session.get('role') or data.get('role')
+    if not user_id or role != 'Teacher':
+        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+
+    dismissal_time = data.get('dismissal_time')
+    message = data.get('message', '')
+    notify_email = data.get('notify_email')
+    notify_sms = data.get('notify_sms')  # ✅ NEW: SMS notification flag
+    grade = data.get('grade')
+    section = data.get('section')
+    student_id = data.get('student_id')
+    if student_id in [None, '', 'None']:
+        student_id = None
+
+    # If "All Grade Level" or "All Section" is selected, treat as None
+    if grade == 'All Grade Level':
+        grade = None
+    if section == 'All Section':
+        section = None
+
+    # ✅ Format time to AM/PM for display
+    dismissal_time_formatted = dismissal_time
+    try:
+        dt = None
+        try:
+            dt = datetime.strptime(dismissal_time, "%H:%M")
+        except Exception:
+            try:
+                dt = datetime.strptime(dismissal_time, "%I:%M %p")
+            except Exception:
+                dt = None
+        if dt:
+            dismissal_time_formatted = dt.strftime("%I:%M %p").lstrip("0")
+    except Exception:
+        dismissal_time_formatted = dismissal_time
+
+    # Query students: if no grade/section/student_id, get all students handled by teacher
+    students_query = supabase.table('user_info').select('id, first_name, last_name, year_level, section').eq('role', 'Student')
+    if student_id is not None:
+        students_query = students_query.eq('id', student_id)
+    elif grade or section:
+        if grade:
+            students_query = students_query.eq('year_level', grade)
+        if section:
+            students_query = students_query.eq('section', section)
+    else:
+        # Get all students handled by teacher
+        assignments = safe_execute(
+            supabase.table('teacher_class_assignments')
+            .select('grade_level', 'section')
+            .eq('teacher_id', user_id)
+        ).data or []
+        student_ids = set()
+        for a in assignments:
+            grade_level = a.get('grade_level')
+            section_val = a.get('section')
+            students_result = safe_execute(
+                supabase.table('user_info')
+                .select('id')
+                .eq('role', 'Student')
+                .eq('year_level', grade_level)
+                .eq('section', section_val)
+            )
+            if students_result and hasattr(students_result, 'data') and students_result.data:
+                for s in students_result.data:
+                    student_ids.add(s['id'])
+        students_query = supabase.table('user_info').select('id, first_name, last_name, year_level, section').in_('id', list(student_ids))
+
+    students_result = students_query.execute()
+    students = students_result.data if students_result.data else []
+
+    if not students:
+        return jsonify({'success': False, 'message': 'No students found.'}), 404
+
+    # ✅ Get teacher's name for notifications
+    teacher_info = supabase.table('user_info').select('first_name, last_name', 'gender').eq('id', user_id).execute()
+    teacher_name = ''
+    if teacher_info.data and len(teacher_info.data) > 0:
+        teacher_name = f"{teacher_info.data[0].get('first_name', '')} {teacher_info.data[0].get('last_name', '')}"
+
+    # Prepare student IDs as both string and int for parent lookup
+    student_ids_str = [str(s['id']).strip() for s in students]
+    student_ids_int = []
+    for sid in student_ids_str:
+        try:
+            student_ids_int.append(int(sid))
+        except ValueError:
+            pass
+
+    # Query parents table for emails and phone numbers
+    parents = []
+    try:
+        parents_result = supabase.table('parents').select('student_id, email, mobile_no, relationship, first_name, last_name').in_('student_id', student_ids_str).execute()
+        parents = parents_result.data if parents_result.data else []
+    except Exception as e:
+        print(f"DEBUG: String query failed: {e}")
+
+    if not parents and student_ids_int:
+        try:
+            parents_result = supabase.table('parents').select('student_id, email, mobile_no, relationship, first_name, last_name').in_('student_id', student_ids_int).execute()
+            parents = parents_result.data if parents_result.data else []
+        except Exception as e:
+            print(f"DEBUG: Integer query failed: {e}")
+
+    # Fallback: try individual queries for first 2 students if still no parents found
+    if not parents:
+        for student_id_str in student_ids_str[:2]:
+            try:
+                individual_result = supabase.table('parents').select('student_id, email, mobile_no, relationship, first_name, last_name').eq('student_id', student_id_str).execute()
+                individual_parents = individual_result.data if individual_result.data else []
+                if individual_parents:
+                    parents.extend(individual_parents)
+            except Exception as e:
+                print(f"DEBUG: Individual query for {student_id_str} failed: {e}")
+
+    # ✅ Map student_id to list of parent emails and phone numbers
+    parent_email_map = {}
+    parent_phone_map = {}
+    for p in parents:
+        sid = str(p['student_id']).strip()
+        
+        # Email mapping
+        if p.get('email') and p['email'].strip():
+            if sid not in parent_email_map:
+                parent_email_map[sid] = []
+            parent_email_map[sid].append({
+                'email': p['email'].strip(),
+                'name': f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
+                'relationship': p.get('relationship', 'Parent')
+            })
+        
+        # Phone mapping
+        if p.get('mobile_no') and p['mobile_no'].strip():
+            if sid not in parent_phone_map:
+                parent_phone_map[sid] = []
+            parent_phone_map[sid].append({
+                'phone': p['mobile_no'].strip(),
+                'name': f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
+                'relationship': p.get('relationship', 'Parent')
+            })
+
+    sent_count = 0
+    email_sent_count = 0
+    sms_sent_count = 0
+    students_without_parents = []
+    email_failures = []
+    sms_failures = []
+
+    # ✅ Build base message
+    base_message = "Dear Parent,\n\nThis is to inform you that your child, {student_name}, has been dismissed at {dismissal_time}.\n\nMasico National High School\nGrade: {grade} - Section: {section}"
+    
+    if message:
+        base_message += f"\n\nNote: {message}"
+    
+    base_message += f"\n\nThank you,\nLearn2Earn\nTeacher: {teacher_name}"
+
+    # ✅ SEND EMAIL NOTIFICATIONS
+    if notify_email:
+        for student in students:
+            sid = str(student['id']).strip()
+            parent_emails = parent_email_map.get(sid, [])
+            
+            if parent_emails:
+                student_name = f"{student['first_name']} {student['last_name']}"
+                grade_level = student.get('year_level', 'Unknown')
+                section_name = student.get('section', 'Unknown')
+                
+                email_body = base_message.format(
+                    student_name=student_name,
+                    dismissal_time=dismissal_time_formatted,
+                    grade=grade_level,
+                    section=section_name
+                )
+                
+                for parent in parent_emails:
+                    subject = "Dismissal Notification"
+                    msg = Message(subject, sender=app.config['MAIL_USERNAME'], recipients=[parent['email']])
+                    msg.body = email_body
+                    
+                    try:
+                        mail.send(msg)
+                        email_sent_count += 1
+                        sent_count += 1
+                    except Exception as e:
+                        app.logger.error(f"Failed to send dismissal email to {parent['email']}: {str(e)}")
+                        email_failures.append(f"{student_name} - {parent['name']} ({parent['email']})")
+            else:
+                student_name = f"{student['first_name']} {student['last_name']}"
+                if student_name not in students_without_parents:
+                    students_without_parents.append(student_name)
+
+    # ✅ SEND SMS NOTIFICATIONS
+    if notify_sms:
+        for student in students:
+            sid = str(student['id']).strip()
+            parent_phones = parent_phone_map.get(sid, [])
+            
+            if parent_phones:
+                student_name = f"{student['first_name']} {student['last_name']}"
+                grade_level = student.get('year_level', 'Unknown')
+                section_name = student.get('section', 'Unknown')
+                
+                sms_message = base_message.format(
+                    student_name=student_name,
+                    dismissal_time=dismissal_time_formatted,
+                    grade=grade_level,
+                    section=section_name
+                )
+                
+                for parent in parent_phones:
+                    parent_number = parent['phone']
+                    
+                    # ✅ Convert to +63 format if needed
+                    if parent_number and parent_number.startswith('0'):
+                        parent_number = '+63' + parent_number[1:]
+                    elif parent_number and not parent_number.startswith('+'):
+                        parent_number = '+63' + parent_number
+                    
+                    # ✅ Only send if we have a valid phone number
+                    if parent_number and len(parent_number) >= 12:
+                        sms_result = send_sms_via_api(parent_number, sms_message, student['id'])
+                        
+                        if sms_result['success']:
+                            sms_sent_count += 1
+                            sent_count += 1
+                        else:
+                            sms_failures.append(f"{student_name} - {parent['name']} ({parent_number}): {sms_result['error']}")
+                    else:
+                        sms_failures.append(f"{student_name} - {parent['name']}: Invalid phone number format")
+            else:
+                student_name = f"{student['first_name']} {student['last_name']}"
+                if student_name not in students_without_parents:
+                    students_without_parents.append(student_name)
+
+    # ✅ Build response message
+    response_parts = []
+    if notify_email:
+        response_parts.append(f'Emails sent: {email_sent_count}')
+    if notify_sms:
+        response_parts.append(f'SMS sent: {sms_sent_count}')
+    
+    response_message = 'Dismissal notification sent! ' + ' | '.join(response_parts) if response_parts else 'Dismissal notification sent!'
+    
+    if students_without_parents:
+        response_message += f' (Note: {len(students_without_parents)} students have no parent contact on file)'
+
+    # ✅ Build result data with all details
+    result_data = {
+        'success': True,
+        'sent_count': sent_count,
+        'email_sent_count': email_sent_count,
+        'sms_sent_count': sms_sent_count,
+        'message': response_message,
+        'students_without_contacts': students_without_parents
+    }
+    
+    if email_failures:
+        result_data['email_failures'] = email_failures
+    if sms_failures:
+        result_data['sms_failures'] = sms_failures
+
+    return jsonify(result_data)
+
+
+# ✅ SEND SMS VIA HTTPSMS API
+def send_sms_via_api(phone_number, message, student_id):
+    """Send SMS via HTTPSMS API"""
+    HTTPSMS_API_KEY = "uk_2ublvy1otAtb3S-BQa9KZfIywUgGh6cXqc5ONgJb-fBRs9s8HU7ODFqO32qBEm7H"
+    
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": HTTPSMS_API_KEY,
+        "Accept": "application/json"
+    }
+
+    payload = {
+        "content": message,
+        "from": "+639761271972",  # ✅ Your registered number
+        "to": phone_number
+    }
+
+    try:
+        response = requests.post(
+            "https://api.httpsms.com/v1/messages/send",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        # ✅ Save to Supabase SMS log
+        safe_execute(supabase.table('sms_messages').insert({
+            "phone_number": phone_number,
+            "message": message,
+            "status": "sent" if response.status_code == 200 else "failed",
+            "sent_at": datetime.now().isoformat(),
+            "student_id": student_id,
+            "message_type": "dismissal_notification",
+            "response_data": json.dumps({
+                "status_code": response.status_code,
+                "response": response.text[:500]  # Limit response text
+            })
+        }))
+
+        if response.status_code == 200:
+            return {"success": True, "message": "SMS sent successfully"}
+        else:
+            return {"success": False, "error": f"HTTP {response.status_code}"}
+            
+    except Exception as e:
+        # ✅ Log error to Supabase
+        try:
+            safe_execute(supabase.table('sms_messages').insert({
+                "phone_number": phone_number,
+                "message": message,
+                "status": "failed",
+                "sent_at": datetime.now().isoformat(),
+                "student_id": student_id,
+                "message_type": "dismissal_notification",
+                "response_data": json.dumps({"error": str(e)[:200]})
+            }))
+        except Exception as log_e:
+            print(f"Failed to log SMS error: {log_e}")
+        
+        return {"success": False, "error": str(e)[:100]}
+
+
+# ====================================================================================================
+#                                         TEACHER STUDENT PAGE END
+# ====================================================================================================
 
 
 
@@ -5115,6 +6581,10 @@ def api_nlp_notification():
 
 
 
+
+# ====================================================================================================
+#                                         TEACHER REWARDS PAGE START
+# ====================================================================================================
 
 
 # --- TEACHER REWARDS PAGE DISPLAY ROUTE ---
@@ -5217,13 +6687,31 @@ def add_reward():
                 'details': '',
             }))
 
+            # Get teacher info for notification
+            teacher_info = safe_execute(
+                supabase.table('user_info')
+                .select('last_name, gender')
+                .eq('id', teacher_id)
+            )
+            teacher_last_name = ''
+            teacher_gender = ''
+            if teacher_info.data and len(teacher_info.data) > 0:
+                teacher_last_name = teacher_info.data[0].get('last_name', '')
+                teacher_gender = teacher_info.data[0].get('gender', '')
+            prefix = 'Mr.'
+            if teacher_gender == 'female':
+                prefix = 'Ms.'
+            elif teacher_gender == 'other':
+                prefix = 'Mx.'
+            teacher_name = f"{prefix} {teacher_last_name}"
+
             # Notify all students in these classrooms
             students_query = supabase.table('user_info').select('id').eq('role', 'Student').in_('year_level', grade_levels).in_('section', sections)
             students_result = students_query.execute()
             students = students_result.data if students_result.data else []
 
             notif_title = "New Reward Available"
-            notif_message = f"Your teacher has added a new reward: {reward_name} ({point_cost} pts, Qty: {available_quantity}). Check the rewards page!"
+            notif_message = f"{teacher_name} has added a new reward: {reward_name} ({point_cost} pts, Qty: {available_quantity}). Check the rewards page!"
 
             for student in students:
                 supabase.table('notifications').insert({
@@ -5278,6 +6766,24 @@ def add_reward():
             'details': '',
         }))
 
+        # Get teacher info for notification
+        teacher_info = safe_execute(
+            supabase.table('user_info')
+            .select('last_name, gender')
+            .eq('id', teacher_id)
+        )
+        teacher_last_name = ''
+        teacher_gender = ''
+        if teacher_info.data and len(teacher_info.data) > 0:
+            teacher_last_name = teacher_info.data[0].get('last_name', '')
+            teacher_gender = teacher_info.data[0].get('gender', '')
+        prefix = 'Mr.'
+        if teacher_gender == 'female':
+            prefix = 'Ms.'
+        elif teacher_gender == 'other':
+            prefix = 'Mx.'
+        teacher_name = f"{prefix} {teacher_last_name}"
+
         # Notify students in selected classroom
         students_query = supabase.table('user_info').select('id').eq('role', 'Student')
         if grade_level:
@@ -5288,7 +6794,7 @@ def add_reward():
         students = students_result.data if students_result.data else []
 
         notif_title = "New Reward Available"
-        notif_message = f"Your teacher has added a new reward: {reward_name} ({point_cost} pts, Qty: {available_quantity}). Check the rewards page!"
+        notif_message = f"{teacher_name} has added a new reward: {reward_name} ({point_cost} pts, Qty: {available_quantity}). Check the rewards page!"
 
         for student in students:
             supabase.table('notifications').insert({
@@ -5432,7 +6938,7 @@ def update_reward(reward_id):
 
 
 
-# --- TEACHER REWARDS PAGE PARA SA REWARD REDEEMED OVERVIEW ROUTE ---
+# --- TEACHER REWARDS PAGE PARA SA REWARD REDEEMED OVERVIEW ROUTE SECTION ---
 @app.route('/rewards_redeemed_overview', methods=['GET'])
 def rewards_redeemed_overview():
     teacher_id = request.args.get('user_id') or session.get('user_id')
@@ -5548,7 +7054,7 @@ def use_reward_redemption(redemption_id):
 
 
 
-# --- TEACHER REWARD REDEMPTION HISTORY PAGE ROUTE ---
+# --- TEACHER REWARD REDEMPTION HISTORY PAGE SECTION ROUTE ---
 @app.route('/teacher_reward_redemption_history', methods=['GET'])
 def teacher_redemption_history():
     """
@@ -5841,10 +7347,6 @@ def teacher_redemption_history():
 
 # --- TEACHER REWARD EXPORT REDEMPTIONS EXCEL ROUTE ---
 import io
-try:
-    import pandas as pd
-except Exception:
-    pd = None
 
 @app.route('/export_redemptions', methods=['POST'])
 def export_redemptions():
@@ -5853,10 +7355,9 @@ def export_redemptions():
     """
     try:
         import io
+        import pandas as pd
         from openpyxl.styles import Font, Alignment
         from openpyxl.utils import get_column_letter
-        if pd is None:
-            return jsonify({'success': False, 'error': 'Pandas not installed on server'}), 500
 
         data = request.get_json() or {}
         teacher_id = data.get('teacher_id') or data.get('user_id')
@@ -6088,6 +7589,20 @@ def export_redemptions():
         return jsonify({'success': False, 'error': str(e)}), 500
     
 
+# ====================================================================================================
+#                                         TEACHER REWARDS PAGE END
+# ====================================================================================================
+
+
+
+
+
+
+
+
+# ====================================================================================================
+#                                         TEACHER AWARDS PAGE START
+# ====================================================================================================
 
 
 # --- TEACHER AWARD POINTS PAGE DISPLAY CLASSROOMS AND STUDENTS ROUTE ---
@@ -6518,7 +8033,6 @@ def teacher_bulk_award_points():
 
 
 
-
 # --- TEACHER AWARD HISTORY PAGE DISPLAY ROUTE ---
 @app.route('/teacher_award_history', methods=['GET'])
 def teacher_award_history():
@@ -6655,22 +8169,19 @@ def teacher_award_history():
         print('teacher_award_history ERROR:', traceback.format_exc())
         return jsonify({'success': False, 'error': str(e)}), 500
 
-import io
-try:
-    import pandas as pd
-except Exception:
-    pd = None
 
+
+import io
+# --- TEACHER AWARD EXPORT DISPLAY ROUTE ---
 @app.route('/export_awards', methods=['POST'])
 def export_awards():
     """
     Export teacher award history to Excel (.xlsx) with optional summary statistics.
     """
     try:
+        import pandas as pd
         from openpyxl.styles import Font, Alignment
         from openpyxl.utils import get_column_letter
-        if pd is None:
-            return jsonify({'success': False, 'error': 'Pandas not installed on server'}), 500
 
         data = request.get_json() or {}
         teacher_id = data.get('teacher_id') or data.get('user_id')
@@ -6834,7 +8345,24 @@ def export_awards():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
-# --- TEACHER TASKS PAGKUHA NG GRADE & SECTION AT MGA CURRENT AT FINISH ACT ROUTE ---
+# ====================================================================================================
+#                                         TEACHER AWARDS POINTS PAGE END
+# ====================================================================================================
+
+
+
+
+
+
+
+
+
+# ====================================================================================================
+#                                         TEACHER ACTIVITY MANAGEMENT PAGE START
+# ====================================================================================================
+
+
+# --- TEACHER ACTIVITY PAGKUHA NG GRADE & SECTION AT MGA CURRENT AT FINISH ACT AT PAG FETC NG MGA STATUS NA SUBMISSION ROUTE ---
 @app.route('/teacher_tasks', methods=['GET'])
 def get_teacher_tasks():
     user_id = request.args.get('user_id')
@@ -6855,86 +8383,123 @@ def get_teacher_tasks():
     for c in classrooms:
         key = (c['grade_level'], c['section'])
         if key not in seen:
-            seen.add(key)
             unique_classrooms.append(c)
+            seen.add(key)
 
     # 2. Get tasks (current and finished)
     today = datetime.now().date().isoformat()
 
-    # Fetch all tasks for this teacher
+    # Fetch all tasks for this teacher (INCLUDE attachments and links and activity_group_id)
     all_tasks_resp = safe_execute(
         supabase.table('task_assignments')
-        .select('task_id, task, points, description, due_date, priority, status, grade_level, section, image_urls, template, student_id, user_info!task_assignments_student_id_fkey(first_name, last_name)')
+        .select('task_id, activity_group_id, task, points, description, due_date, priority, status, grade_level, section, image_urls, template, teacher_id, student_id, attachments, links, user_info!task_assignments_student_id_fkey(first_name, last_name)')
         .eq('teacher_id', user_id)
     )
     all_tasks = all_tasks_resp.data if all_tasks_resp.data else []
 
-    # Group by (task, grade_level, section, due_date, etc) for activity, and collect students per activity
     from collections import defaultdict
     activity_map = {}
     students_map = defaultdict(list)
     for row in all_tasks:
-        # Key for unique activity
         key = (
             row.get('task'),
             row.get('grade_level'),
             row.get('section'),
             row.get('due_date'),
         )
-        # Save activity info (one per key)
         if key not in activity_map:
             activity_map[key] = {
-                'task_id': row.get('task_id'),
                 'task': row.get('task'),
-                'points': row.get('points'),
-                'description': row.get('description'),
-                'due_date': row.get('due_date'),
-                'priority': row.get('priority'),
-                'status': row.get('status'),
                 'grade_level': row.get('grade_level'),
                 'section': row.get('section'),
-                'image_urls': row.get('image_urls'),
-                'template': row.get('template'),
-                'students': []  # to be filled
+                'description': row.get('description'),
+                'due_date': row.get('due_date'),
+                'points': row.get('points'),
+                'priority': row.get('priority'),
+                'template': row.get('template') or 'default',
+                'task_id': row.get('task_id'),
+                'teacher_id': row.get('teacher_id'),
+                'attachments': row.get('attachments') or [],
+                'links': row.get('links') or [],
+                'activity_group_id': row.get('activity_group_id') or '',
+                'students': [],
+                'student_count': 0,
+                'pending_count': 0,
+                'completed_count': 0,
+                'denied_count': 0,
+                'assigned_count': 0,
             }
         # Build student info
         student_id = row.get('student_id')
+        task_id = row.get('task_id')
         name = ''
         if row.get('user_info'):
             name = f"{row['user_info'].get('first_name', '')} {row['user_info'].get('last_name', '')}".strip()
-        # Optionally, fetch proof_files here if needed (can batch if required)
+        # Fetch proof files for this student and task
+        proof_files = []
+        if task_id and student_id:
+            try:
+                files_resp = safe_execute(
+                    supabase.table('task_file_submissions')
+                    .select('*')
+                    .eq('task_id', task_id)
+                    .eq('student_id', student_id)
+                    .order('uploaded_at', desc=True)
+                )
+                if files_resp.data:
+                    proof_files = files_resp.data
+            except Exception as e:
+                print(f"Error fetching proof files for task {task_id}, student {student_id}: {e}")
+                proof_files = []
         students_map[key].append({
             'student_id': student_id,
             'name': name,
             'status': row.get('status'),
-            'proof_files': row.get('proof_files', []),  # If you want to fetch proof_files, batch fetch here
+            'proof_files': proof_files,  # <-- always a list of dicts
         })
 
     # Attach students to each activity
     for key, activity in activity_map.items():
         activity['students'] = students_map[key]
+        activity['student_count'] = len(students_map[key])
+        assigned = pending = completed = denied = 0
+        for s in students_map[key]:
+            status = (s['status'] or '').lower()
+            if status == 'assigned':
+                assigned += 1
+            elif status == 'pending':
+                pending += 1
+            elif status == 'completed':
+                completed += 1
+            elif status == 'denied':
+                denied += 1
+        activity['assigned_count'] = assigned
+        activity['pending_count'] = pending
+        activity['completed_count'] = completed
+        activity['denied_count'] = denied
+
+    # --- DEBUG: Print activities with attachments and links ---
+    print("=== DEBUG: Activities to be sent to frontend ===")
+    for act in activity_map.values():
+        print(f"Task: {act['task']} | Attachments: {act['attachments']} | Links: {act['links']} | GroupID: {act['activity_group_id']}")
 
     # Split into current and finished based on status and due_date
     current_tasks = []
     finished_tasks = []
     for activity in activity_map.values():
-        # If any student is still Assigned or Pending and due_date >= today, it's current
         is_current = False
         try:
             due_date = activity.get('due_date')
             if due_date:
-                due_date_val = due_date
-                if isinstance(due_date, str):
-                    due_date_val = due_date
-                else:
-                    due_date_val = str(due_date)
-                if due_date_val >= today:
-                    for s in activity['students']:
-                        if s.get('status') in ['Assigned', 'Pending']:
-                            is_current = True
-                            break
+                due_dt = datetime.strptime(str(due_date), "%Y-%m-%d")
+                if due_dt >= datetime.now():
+                    is_current = True
         except Exception:
-            pass
+            is_current = True  # If date parsing fails, treat as current
+        if activity['completed_count'] + activity['denied_count'] < activity['student_count']:
+            is_current = True
+        else:
+            is_current = False
         if is_current:
             current_tasks.append(activity)
         else:
@@ -6997,12 +8562,11 @@ def get_students_for_activity(task, grade_level, section, due_date):
     return students
 
 
+# --- TEACHER APPROVE ACTIVITY TASK ---
 @app.route('/approve_activity_submissions', methods=['POST'])
 def approve_activity_submissions():
     try:
         data = request.get_json()
-        
-        # ✅ USE user_id DIRECTLY FROM FRONTEND
         user_id = data.get('user_id')
         task_name = data.get('task_name')
         grade_level = data.get('grade_level')
@@ -7010,151 +8574,101 @@ def approve_activity_submissions():
         selected_students = data.get('selected_students', [])
         denied_students = data.get('denied_students', [])
 
-        # ✅ DEBUG: Check teacher_id from frontend
-        print(f"[DEBUG] Teacher ID from frontend: {user_id} (type: {type(user_id)})")
+        teacher_id = int(user_id)
 
-        # ✅ VALIDATE user_id
-        if not user_id or not task_name or not grade_level or not section:
-            return jsonify({'success': False, 'message': 'Missing required parameters'}), 400
-
-        teacher_id = int(user_id)  # Convert to int
-            
-        # Get task info
+        # Get task info (for points)
         task_result = supabase.table('task_assignments') \
             .select('points') \
             .eq('task', task_name) \
             .eq('grade_level', grade_level) \
             .eq('section', section) \
             .limit(1).execute()
-        
         if not task_result.data:
             return jsonify({'success': False, 'message': 'Task not found'}), 404
-        
         points = int(task_result.data[0].get('points', 0))
 
         # Get teacher info for notification
         teacher_info = supabase.table('user_info') \
             .select('last_name, gender') \
             .eq('id', teacher_id).execute()
-        
         teacher_last_name = ''
         teacher_gender = ''
         if teacher_info.data and len(teacher_info.data) > 0:
             teacher_last_name = teacher_info.data[0].get('last_name', '')
-            teacher_gender = (teacher_info.data[0].get('gender', '') or '').lower()
-        
+            teacher_gender = teacher_info.data[0].get('gender', '')
         prefix = 'Mr.'
         if teacher_gender == 'female':
-            prefix = 'Mrs.'
+            prefix = 'Ms.'
         elif teacher_gender == 'other':
             prefix = 'Mx.'
         teacher_name = f"{prefix} {teacher_last_name}"
 
         # ===== PROCESS SELECTED STUDENTS =====
         for student_id in selected_students:
-            try:
-                student_id_int = int(student_id) if isinstance(student_id, str) else student_id
-                
-                # Find assignment
-                assignment = supabase.table('task_assignments') \
-                    .select('task_id, status') \
-                    .eq('task', task_name) \
-                    .eq('student_id', student_id_int) \
-                    .eq('grade_level', grade_level) \
-                    .eq('section', section) \
-                    .limit(1).execute()
-                
-                if assignment.data:
-                    assignment_id = assignment.data[0]['task_id']
-                    current_status = assignment.data[0].get('status')
-                    
-                    point_id = None
-                    
-                    if current_status == 'Pending':
-                        # Insert points with FRONTEND teacher_id
-                        point_result = supabase.table('points').insert({
-                            'teacher_id': teacher_id,  # ✅ FROM FRONTEND
-                            'student_id': student_id_int,
-                            'points': points,
-                            'point_category': 'Task',
-                            'note': f"Completed Activity: {task_name}",
-                            'status': 'approved'
-                        }).execute()
-                        
-                        if point_result.data and len(point_result.data) > 0:
-                            point_id = point_result.data[0].get('point_id')
-                        
-                        # Update user total points
-                        user_result = supabase.table('user_info') \
-                            .select('total_points') \
-                            .eq('id', student_id_int).execute()
-                        
-                        current_total = 0
-                        if user_result.data and 'total_points' in user_result.data[0] and user_result.data[0]['total_points'] is not None:
-                            current_total = int(user_result.data[0]['total_points'])
-                        
-                        new_total = current_total + points
-                        
-                        supabase.table('user_info').update({'total_points': new_total}).eq('id', student_id_int).execute()
-                    
-                    # Update task status to Completed
-                    supabase.table('task_assignments').update({
-                        'status': 'Completed'
-                    }).eq('task_id', assignment_id).execute()
-
-                    # Send notification
-                    notif_title = "Activity Approved"
-                    notif_message = f"{teacher_name} has approved your activity '{task_name}' and awarded you {points} points."
-                    supabase.table('notifications').insert({
-                        'user_id': student_id_int,
-                        'sender_id': teacher_id,  # ✅ FROM FRONTEND
-                        'title': notif_title,
-                        'message': notif_message,
-                        'notif_type': 'Task',
-                        'status': 'Unread',
-                        'point_id': point_id,
-                        'task_id': assignment_id
-                    }).execute()
-            except Exception as e:
-                print(f"[DEBUG] ERROR processing student {student_id}: {e}")
-                continue
+            safe_execute(
+                supabase.table('task_assignments')
+                .update({'status': 'Completed'})
+                .eq('task', task_name)
+                .eq('grade_level', grade_level)
+                .eq('section', section)
+                .eq('student_id', student_id)
+            )
+            now = datetime.now().isoformat()
+            safe_execute(
+                supabase.table('points').insert({
+                    'teacher_id': teacher_id,
+                    'student_id': student_id,
+                    'points': points,
+                    'point_category': 'Activity',
+                    'note': f'Completed task: {task_name}',
+                    'status': 'approved',
+                    'received_at': now
+                })
+            )
+            user_result = safe_execute(
+                supabase.table('user_info').select('total_points').eq('id', student_id)
+            )
+            current_total = 0
+            if user_result.data and len(user_result.data) > 0:
+                current_total = user_result.data[0].get('total_points', 0)
+            new_total = current_total + points
+            safe_execute(
+                supabase.table('user_info').update({'total_points': new_total}).eq('id', student_id)
+            )
+            safe_execute(
+                supabase.table('notifications').insert({
+                    'user_id': student_id,
+                    'sender_id': teacher_id,
+                    'title': 'Points Awarded',
+                    'message': f"{teacher_name} has awarded you {points} points for completing '{task_name}'.",
+                    'notif_type': 'Points',
+                    'status': 'Unread'
+                })
+            )
 
         # ===== PROCESS DENIED STUDENTS =====
         for student_id in denied_students:
-            try:
-                student_id_int = int(student_id) if isinstance(student_id, str) else student_id
-                
-                assignment = supabase.table('task_assignments') \
-                    .select('task_id') \
-                    .eq('task', task_name) \
-                    .eq('student_id', student_id_int) \
-                    .eq('grade_level', grade_level) \
-                    .eq('section', section) \
-                    .limit(1).execute()
-                
-                if assignment.data:
-                    assignment_id = assignment.data[0]['task_id']
-                    
-                    supabase.table('task_assignments').update({
-                        'status': 'Denied'
-                    }).eq('task_id', assignment_id).execute()
-                    
-                    notif_title = "Task Submission Denied"
-                    notif_message = f"{teacher_name} has denied your submission for '{task_name}'. Please review and resubmit if needed."
-                    supabase.table('notifications').insert({
-                        'user_id': student_id_int,
-                        'sender_id': teacher_id,  # ✅ FROM FRONTEND
-                        'title': notif_title,
-                        'message': notif_message,
-                        'notif_type': 'Task',
-                        'status': 'Unread',
-                        'task_id': assignment_id
-                    }).execute()
-            except Exception as e:
-                print(f"[DEBUG] ERROR processing denied student {student_id}: {e}")
-                continue
+            safe_execute(
+                supabase.table('task_assignments')
+                .update({'status': 'Denied'})
+                .eq('task', task_name)
+                .eq('grade_level', grade_level)
+                .eq('section', section)
+                .eq('student_id', student_id)
+            )
+            safe_execute(
+                supabase.table('notifications').insert({
+                    'user_id': student_id,
+                    'sender_id': teacher_id,
+                    'title': 'Submission Denied',
+                    'message': f"Your submission for '{task_name}' was denied.",
+                    'notif_type': 'Task',
+                    'status': 'Unread'
+                })
+            )
 
-        return jsonify({'success': True, 'message': 'Task submissions processed.'}), 200
+        return jsonify({'success': True}), 200
+
 
     except Exception as e:
         print(f"[DEBUG] CRITICAL EXCEPTION: {e}")
@@ -7162,128 +8676,2143 @@ def approve_activity_submissions():
 
 
 
-# --- MOBILE VERSION: CREATE ACTIVITY/ASSIGN TASK ---
+# --- TEACHER CREATE ACTIVITY/ASSIGN TASK ---
 @app.route('/create_activity', methods=['POST'])
 def create_activity():
     """
-    Mobile version: assign activity/task to classroom.
-    Accepts teacher_id in JSON (no session required).
+    Accepts multipart/form-data or JSON.
+    Creates activity for all students in a class, with a shared activity_group_id.
     """
+    import mimetypes
+    try:
+        # Generate a unique activity_group_id for this activity
+        activity_group_id = str(uuid4())
+
+        def normalize_links(raw_links):
+            normalized = []
+            if not isinstance(raw_links, list):
+                return normalized
+
+            for item in raw_links:
+                parsed_item = item
+                if isinstance(parsed_item, str):
+                    stripped = parsed_item.strip()
+                    if not stripped:
+                        continue
+                    if stripped.startswith('{') or stripped.startswith('['):
+                        try:
+                            parsed_item = json.loads(stripped)
+                            if isinstance(parsed_item, list) and parsed_item:
+                                parsed_item = parsed_item[0]
+                        except Exception:
+                            parsed_item = {'url': stripped, 'title': 'Link'}
+                    else:
+                        parsed_item = {'url': stripped, 'title': 'Link'}
+
+                if isinstance(parsed_item, dict):
+                    link_url = str(parsed_item.get('url') or parsed_item.get('link') or '').strip()
+                    if not link_url:
+                        continue
+                    link_title = str(parsed_item.get('title') or parsed_item.get('name') or 'Link').strip()
+                    normalized.append({
+                        'url': link_url,
+                        'title': link_title or 'Link'
+                    })
+
+            return normalized
+
+        # --- JSON mode ---
+        if request.content_type.startswith('application/json'):
+            data = request.get_json()
+            teacher_id = data.get('teacher_id')
+            grade_level = data.get('grade_level')
+            section = data.get('section')
+            task = data.get('task')
+            points = data.get('points', 0)
+            due_date = data.get('due_date')
+            priority = data.get('priority', 'medium')
+            description = data.get('description', '')
+            template = data.get('template', 'default')
+            attachments = data.get('attachments', [])
+            links = data.get('links', [])
+            links = normalize_links(links)
+            students_result = safe_execute(
+                supabase.table('user_info')
+                .select('id')
+                .eq('role', 'Student')
+                .eq('year_level', grade_level)
+                .eq('section', section)
+            )
+            students = students_result.data if students_result.data else []
+            assignments = []
+            for student in students:
+                assignments.append({
+                    'activity_group_id': activity_group_id,
+                    'teacher_id': teacher_id,
+                    'student_id': student['id'],
+                    'grade_level': grade_level,
+                    'section': section,
+                    'task': task,
+                    'points': points,
+                    'description': description,
+                    'due_date': due_date,
+                    'priority': priority,
+                    'template': template,
+                    'attachments': attachments,
+                    'links': links,
+                    'status': 'Assigned',
+                    'assigned_at': datetime.now().isoformat(),
+                })
+            if assignments:
+                result = safe_execute(supabase.table('task_assignments').insert(assignments))
+                task_ids = [r.get('task_id') for r in result.data] if result.data else []
+                
+                # Send notifications to all students
+                student_ids = [s['id'] for s in students]
+                teacher_info = safe_execute(
+                    supabase.table('user_info')
+                    .select('last_name, gender')
+                    .eq('id', teacher_id)
+                )
+                teacher_last_name = ''
+                teacher_gender = ''
+                if teacher_info.data and len(teacher_info.data) > 0:
+                    teacher_last_name = teacher_info.data[0].get('last_name', '')
+                    teacher_gender = teacher_info.data[0].get('gender', '')
+                prefix = 'Mr.'
+                if teacher_gender == 'female':
+                    prefix = 'Ms.'
+                elif teacher_gender == 'other':
+                    prefix = 'Mx.'
+                teacher_name = f"{prefix} {teacher_last_name}"
+                
+                notifications = []
+                for student_id in student_ids:
+                    notifications.append({
+                        'user_id': student_id,
+                        'sender_id': teacher_id,
+                        'title': 'New Activity',
+                        'message': f"{teacher_name} assigned a new activity: {task}",
+                        'notif_type': 'Task',
+                        'status': 'Unread',
+                    })
+                
+                if notifications:
+                    safe_execute(supabase.table('notifications').insert(notifications))
+                
+                # Log activity to admin_activity_log
+                safe_execute(
+                    supabase.table('admin_activity_log').insert({
+                        'user_id': teacher_id,
+                        'user_role': 'Teacher',
+                        'action': 'Create Activity',
+                        'activity': 'Task Management',
+                        'description': f"Created activity '{task}' for Grade {grade_level} - {section}",
+                        'details': f"Due date: {due_date}, Points: {points}, Students: {len(student_ids)}"
+                    })
+                )
+                
+                return jsonify({
+                    'success': True,
+                    'message': 'Activity created',
+                    'activity_group_id': activity_group_id,
+                    'task_ids': task_ids,
+                    'file_urls': [],
+                }), 200
+            else:
+                return jsonify({'success': False, 'message': 'No students found'}), 400
+
+        # --- MULTIPART mode ---
+        teacher_id = request.form.get('teacher_id')
+        grade_level = request.form.get('grade_level')
+        section = request.form.get('section')
+        task = request.form.get('task')
+        points = int(request.form.get('points', 0))
+        due_date = request.form.get('due_date')
+        priority = request.form.get('priority', 'medium')
+        description = request.form.get('description', '')
+        template = request.form.get('template', 'default')
+        links = request.form.get('links', '[]')
+        try:
+            links = json.loads(links)
+        except Exception:
+            links = []
+        links = normalize_links(links)
+
+        files = request.files.getlist('files')
+        uploaded_file_urls = []
+        file_metadata = []
+
+        for file in files:
+            if file and allowed_file(file.filename):
+                file_ext = file.filename.rsplit('.', 1)[1].lower()
+                unique_filename = f"teacher_{teacher_id}_{datetime.now().strftime('%Y%m%d_%H%M%S%f')}.{file_ext}"
+                file_bytes = file.read()
+                mime_type, _ = mimetypes.guess_type(file.filename)
+                storage_resp = supabase.storage.from_('task-files').upload(unique_filename, file_bytes, {"content-type": mime_type or "application/octet-stream"})
+                public_url = f"https://myetrhrskmbwnmmmxdzt.supabase.co/storage/v1/object/public/task-files/{unique_filename}"
+                uploaded_file_urls.append(public_url)
+                file_metadata.append({
+                    'file_url': public_url,
+                    'original_filename': file.filename,
+                    'file_type': get_file_type(file_ext),
+                    'file_size': len(file_bytes),
+                })
+
+        students_result = safe_execute(
+            supabase.table('user_info')
+            .select('id')
+            .eq('role', 'Student')
+            .eq('year_level', grade_level)
+            .eq('section', section)
+        )
+        students = students_result.data if students_result.data else []
+
+        assignments = []
+        for student in students:
+            assignments.append({
+                'activity_group_id': activity_group_id,
+                'teacher_id': teacher_id,
+                'student_id': student['id'],
+                'grade_level': grade_level,
+                'section': section,
+                'task': task,
+                'points': points,
+                'description': description,
+                'due_date': due_date,
+                'priority': priority,
+                'template': template,
+                'attachments': file_metadata,
+                'links': links,
+                'status': 'Assigned',
+                'assigned_at': datetime.now().isoformat(),
+            })
+
+        if assignments:
+            result = safe_execute(supabase.table('task_assignments').insert(assignments))
+            task_ids = [r.get('task_id') for r in result.data] if result.data else []
+            
+            # Send notifications to all students
+            student_ids = [s['id'] for s in students]
+            teacher_info = safe_execute(
+                supabase.table('user_info')
+                .select('last_name, gender')
+                .eq('id', teacher_id)
+            )
+            teacher_last_name = ''
+            teacher_gender = ''
+            if teacher_info.data and len(teacher_info.data) > 0:
+                teacher_last_name = teacher_info.data[0].get('last_name', '')
+                teacher_gender = teacher_info.data[0].get('gender', '')
+            prefix = 'Mr.'
+            if teacher_gender == 'female':
+                prefix = 'Ms.'
+            elif teacher_gender == 'other':
+                prefix = 'Mx.'
+            teacher_name = f"{prefix} {teacher_last_name}"
+            
+            notifications = []
+            for student_id in student_ids:
+                notifications.append({
+                    'user_id': student_id,
+                    'sender_id': teacher_id,
+                    'title': 'New Activity',
+                    'message': f"{teacher_name} assigned a new activity: {task}",
+                    'notif_type': 'Task',
+                    'status': 'Unread',
+                })
+            
+            if notifications:
+                safe_execute(supabase.table('notifications').insert(notifications))
+            
+            # Log activity to admin_activity_log
+            safe_execute(
+                supabase.table('admin_activity_log').insert({
+                    'user_id': teacher_id,
+                    'user_role': 'Teacher',
+                    'action': 'Create Activity',
+                    'activity': 'Task Management',
+                    'description': f"Created activity '{task}' for Grade {grade_level} - {section}",
+                    'details': f"Due date: {due_date}, Points: {points}, Files: {len(uploaded_file_urls)}, Students: {len(student_ids)}"
+                })
+            )
+            
+            return jsonify({
+                'success': True,
+                'message': 'Activity created sabay-sabay with files',
+                'activity_group_id': activity_group_id,
+                'task_ids': task_ids,
+                'file_urls': uploaded_file_urls,
+            }), 200
+        else:
+            return jsonify({'success': False, 'message': 'No students found'}), 400
+
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+# --- TEACHER UPDATE ACTIVITY ROUTE (MOBILE VERSION) ---
+@app.route('/update_task_attachments', methods=['POST'])
+def update_task_attachments():
     data = request.get_json()
+    task_id = data.get('task_id')
+    attachments = data.get('attachments', [])
+    if not task_id:
+        return jsonify({'success': False, 'message': 'Missing task_id'}), 400
 
-    # --- DEBUG: Print incoming payload for troubleshooting ---
-    print("=== /create_activity DEBUG PAYLOAD ===")
-    print(json.dumps(data, indent=2))
-    print("======================================")
-
-    teacher_id = data.get('teacher_id')
-    grade_level = data.get('grade_level')
-    section = data.get('section')
-    task = data.get('task')
-    points = data.get('points', 0)
-    description = data.get('description', '')
-    due_date = data.get('due_date', None)
-    priority = data.get('priority', 'medium')
-    template = data.get('template', 'default')
-    image_urls = data.get('image_urls', [])
-
-    # Validate required fields
-    if not teacher_id or not grade_level or not section or not task:
-        return jsonify({'success': False, 'message': 'Missing required fields'}), 400
-
-    # Get all students in the selected classroom
-    students_result = safe_execute(
-        supabase.table('user_info')
-        .select('id')
-        .eq('role', 'Student')
-        .eq('year_level', grade_level)
-        .eq('section', section)
+    result = safe_execute(
+        supabase.table('task_assignments')
+        .update({'attachments': attachments})
+        .eq('task_id', task_id)
     )
-    print(f"DEBUG: Searching students with year_level={grade_level}, section={section}")
-    print(f"DEBUG: Students found: {students_result.data}")
+    if hasattr(result, 'error') and result.error:
+        return jsonify({'success': False, 'message': str(result.error)}), 500
 
-    students = students_result.data if students_result.data else []
+    return jsonify({'success': True, 'message': 'Attachments updated'}), 200
 
-    assignments = []
-    for student in students:
-        assignments.append({
+
+# --- TEACHER UPDATE ACTIVITY ROUTE (MOBILE VERSION) ---
+@app.route('/update_activity', methods=['POST'])
+def update_activity():
+    """
+    Update an existing activity and its attachments/links.
+    Accepts multipart/form-data or JSON.
+    Updates ALL rows with the same activity_group_id.
+    """
+    try:
+        import json
+        from datetime import datetime
+
+        def normalize_links(raw_links):
+            normalized = []
+            if not isinstance(raw_links, list):
+                return normalized
+
+            for item in raw_links:
+                parsed_item = item
+                if isinstance(parsed_item, str):
+                    stripped = parsed_item.strip()
+                    if not stripped:
+                        continue
+                    if stripped.startswith('{') or stripped.startswith('['):
+                        try:
+                            parsed_item = json.loads(stripped)
+                            if isinstance(parsed_item, list) and parsed_item:
+                                parsed_item = parsed_item[0]
+                        except Exception:
+                            parsed_item = {'url': stripped, 'title': 'Link'}
+                    else:
+                        parsed_item = {'url': stripped, 'title': 'Link'}
+
+                if isinstance(parsed_item, dict):
+                    link_url = str(parsed_item.get('url') or parsed_item.get('link') or '').strip()
+                    if not link_url:
+                        continue
+                    link_title = str(parsed_item.get('title') or parsed_item.get('name') or 'Link').strip()
+                    normalized.append({
+                        'url': link_url,
+                        'title': link_title or 'Link'
+                    })
+
+            return normalized
+
+        # Accept both JSON and multipart
+        if request.content_type and request.content_type.startswith('application/json'):
+            data = request.get_json()
+            activity_group_id = data.get('activity_group_id')
+            teacher_id = data.get('teacher_id')
+            grade_level = data.get('grade_level')
+            section = data.get('section')
+            task = data.get('task')
+            points = data.get('points')
+            due_date = data.get('due_date')
+            priority = data.get('priority')
+            description = data.get('description', '')
+            template = data.get('template', 'default')
+            links = data.get('links', [])
+            links = normalize_links(links)
+            existing_files = data.get('existing_files', [])
+            uploaded_files = []
+        else:
+            activity_group_id = request.form.get('activity_group_id')
+            print(f"[DEBUG] Received activity_group_id (FORM): {activity_group_id}")
+            teacher_id = request.form.get('teacher_id')
+            grade_level = request.form.get('grade_level')
+            section = request.form.get('section')
+            task = request.form.get('task')
+            points = request.form.get('points')
+            due_date = request.form.get('due_date')
+            priority = request.form.get('priority')
+            description = request.form.get('description', '')
+            template = request.form.get('template', 'default')
+            links = request.form.get('links', '[]')
+            try:
+                links = json.loads(links)
+            except Exception:
+                links = []
+            links = normalize_links(links)
+            existing_files = request.form.get('existing_files', '[]')
+            try:
+                existing_files = json.loads(existing_files)
+            except Exception:
+                existing_files = []
+            files = request.files.getlist('files')
+            uploaded_files = []
+            for file in files:
+                if file and file.filename:
+                    file_ext = file.filename.rsplit('.', 1)[1].lower()
+                    unique_filename = f"task_{activity_group_id}_{datetime.now().strftime('%Y%m%d_%H%M%S%f')}.{file_ext}"
+                    file_bytes = file.read()
+                    storage_resp = supabase.storage.from_('task-files').upload(unique_filename, file_bytes, {"content-type": file.mimetype})
+                    if hasattr(storage_resp, 'error') and storage_resp.error is not None:
+                        continue
+                    public_url = f"https://myetrhrskmbwnmmmxdzt.supabase.co/storage/v1/object/public/task-files/{unique_filename}"
+                    uploaded_files.append({
+                        'file_url': public_url,
+                        'original_filename': file.filename,
+                        'file_type': file_ext,
+                        'file_size': len(file_bytes)
+                    })
+
+        if not activity_group_id:
+            return jsonify({'success': False, 'message': 'Missing activity_group_id'}), 400
+
+        # Combine existing files and newly uploaded files
+        all_files = []
+        if isinstance(existing_files, list):
+            all_files.extend(existing_files)
+        if uploaded_files:
+            all_files.extend(uploaded_files)
+
+        update_data = {
             'teacher_id': teacher_id,
-            'student_id': student['id'],
             'grade_level': grade_level,
             'section': section,
             'task': task,
             'points': points,
-            'description': description,
             'due_date': due_date,
             'priority': priority,
+            'description': description,
             'template': template,
-           
-            'status': 'Assigned',
-            'assigned_at': datetime.now().isoformat(),
-        })
+            'links': links,
+            'attachments': all_files,
+        }
 
-    if assignments:
-        result = safe_execute(supabase.table('task_assignments').insert(assignments))
-        if hasattr(result, 'error') and result.error:
-            return jsonify({'success': False, 'message': str(result.error)}), 400
-
-        # --- ACTIVITY LOG: Create Activities ---
-        safe_execute(supabase.table('admin_activity_log').insert({
-            'user_id': teacher_id,
-            'user_role': 'Teacher',
-            'action': 'Create Activities',
-            'activity': 'Activities Management',
-            'description': f"Assigned Activity '{task}' for Grade {grade_level} Section {section} (Points: {points})",
-            'details': '',
-        }))
-
-        # --- SEND NOTIFICATION TO STUDENTS ---
-        teacher_info = safe_execute(
-            supabase.table('user_info').select('last_name', 'gender').eq('id', teacher_id)
+        # ✅ Update ALL rows with the same activity_group_id
+        result = safe_execute(
+            supabase.table('task_assignments')
+            .update(update_data)
+            .eq('activity_group_id', activity_group_id)
         )
-        teacher_last_name = ''
-        teacher_gender = ''
-        if teacher_info.data and len(teacher_info.data) > 0:
-            teacher_last_name = teacher_info.data[0].get('last_name', '')
-            teacher_gender = (teacher_info.data[0].get('gender', '') or '').lower()
-        prefix = 'Mr.'
-        if teacher_gender == 'female':
-            prefix = 'Mrs.'
-        elif teacher_gender == 'other':
-            prefix = 'Mx.'
-        teacher_name = f"{prefix} {teacher_last_name}"
 
-        notif_title = "New Activity Assigned"
-        notif_message = f"{teacher_name} has assigned you a new activity: '{task}'."
+        return jsonify({'success': True, 'message': 'Activity updated successfully'}), 200
 
-        if result.data:
-            for i, student in enumerate(students):
+    except Exception as e:
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+
+# --- TEACHER QUIZ ROUTE (MOBILE VERSION) ---
+
+try:
+    # ✅ Science Datasets
+    from datasets.science.science_grade7_dataset import SCIENCE_GRADE7_QUESTIONS
+    from datasets.science.science_grade8_dataset import SCIENCE_GRADE8_QUESTIONS
+    from datasets.science.science_grade9_dataset import SCIENCE_GRADE9_QUESTIONS
+    from datasets.science.science_grade10_dataset import SCIENCE_GRADE10_QUESTIONS
+    from datasets.science.quiz_generator import ScienceQuizGenerator
+    
+    # ✅ Math Datasets
+    from datasets.math.math_grade7_dataset import MATH_GRADE7_QUESTIONS
+    from datasets.math.math_grade8_dataset import MATH_GRADE8_QUESTIONS
+    from datasets.math.math_grade9_dataset import MATH_GRADE9_QUESTIONS
+    from datasets.math.math_grade10_dataset import MATH_GRADE10_QUESTIONS
+    
+    # ✅ Initialize Science Quiz Generator (Still used for analysis/generation logic)
+    quiz_generator = ScienceQuizGenerator(
+        SCIENCE_GRADE7_QUESTIONS,
+        SCIENCE_GRADE8_QUESTIONS,
+        SCIENCE_GRADE9_QUESTIONS,
+        SCIENCE_GRADE10_QUESTIONS
+    )
+    
+    # ✅ UNIFIED QUIZ DATASETS STRUCTURE - Same format for all subjects
+    # This makes it easy to add English, Filipino, etc. in the future without confusion
+    QUIZ_DATASETS = {
+        'science': {
+            'grade_7': SCIENCE_GRADE7_QUESTIONS,
+            'grade_8': SCIENCE_GRADE8_QUESTIONS,
+            'grade_9': SCIENCE_GRADE9_QUESTIONS,
+            'grade_10': SCIENCE_GRADE10_QUESTIONS,
+        },
+        'math': {
+            'grade_7': MATH_GRADE7_QUESTIONS,
+            'grade_8': MATH_GRADE8_QUESTIONS,
+            'grade_9': MATH_GRADE9_QUESTIONS,
+            'grade_10': MATH_GRADE10_QUESTIONS,
+        }
+    }
+    
+    print("✅ Quiz generator initialized successfully (Science + Math)")
+except ImportError as e:
+    print(f"⚠️ Quiz generator not available: {e}")
+    # ✅ Same structure for fallback - empty datasets
+    QUIZ_DATASETS = {
+        'science': {
+            'grade_7': [],
+            'grade_8': [],
+            'grade_9': [],
+            'grade_10': [],
+        },
+        'math': {
+            'grade_7': [],
+            'grade_8': [],
+            'grade_9': [],
+            'grade_10': [],
+        }
+    }
+    quiz_generator = None
+
+def get_quiz_questions(subject, grade):
+    """
+    Get quiz questions by subject and grade level.
+    
+    Args:
+        subject (str): Subject name ('science', 'math', 'english', 'filipino', etc.)
+        grade (int): Grade level (7, 8, 9, or 10)
+    
+    Returns:
+        list: Questions for the subject and grade, or empty list if not found
+    
+    Example:
+        questions = get_quiz_questions('science', 8)
+        questions = get_quiz_questions('math', 9)
+    """
+    try:
+        subject = subject.lower().strip()
+        grade_key = f'grade_{grade}'
+        
+        # Check if subject exists in datasets
+        if subject not in QUIZ_DATASETS:
+            print(f"⚠️ Subject '{subject}' not found. Available: {list(QUIZ_DATASETS.keys())}")
+            return []
+        
+        # Check if grade exists for this subject
+        if grade_key not in QUIZ_DATASETS[subject]:
+            print(f"⚠️ Grade {grade} not found for {subject}. Available grades: 7-10")
+            return []
+        
+        return QUIZ_DATASETS[subject][grade_key]
+    
+    except Exception as e:
+        print(f"❌ Error getting quiz questions for {subject} grade {grade}: {e}")
+        return []
+
+
+
+# --- TEACHER ANALYZE LESSON ROUTE (MOBILE VERSION) ---
+@app.route('/api/mobile/analyze-lesson', methods=['POST'])
+def mobile_analyze_lesson():
+    """Analyze uploaded lesson plan and extract topics and quarter (Mobile)"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'File type not allowed'}), 400
+        
+        # Extract text from file
+        lesson_text = extract_text_from_file(file)
+        
+        if not lesson_text:
+            return jsonify({'error': 'Could not extract text from file'}), 400
+        
+        # Validate that the document is actually a lesson plan
+        if quiz_generator is None:
+            return jsonify({'error': 'Quiz generator not available'}), 500
+        
+        try:
+            is_valid_lesson, validation_error = quiz_generator.validate_lesson_plan(lesson_text)
+            if not is_valid_lesson:
+                # Log rejected files for monitoring
+                logger.warning(f"Rejected invalid file: {secure_filename(file.filename)} - Reason: {validation_error}")
+                return jsonify({'error': validation_error, 'rejected': True}), 400
+        except Exception as e:
+            logger.warning(f"Validation check unavailable: {e}")
+        
+        # Analyze using quiz generator
+        try:
+            # Extract topics
+            topics = quiz_generator.extract_topics_from_lesson(lesson_text)
+            
+            # Detect quarter
+            detected_quarter = quiz_generator.detect_quarter_from_lesson(lesson_text)
+            
+            # Get primary topic (highest percentage)
+            primary_topic = None
+            if topics:
+                primary_topic = max(topics.items(), key=lambda x: x[1].get('percentage', 0))[0]
+            
+        except Exception as e:
+            logger.error(f"Error analyzing lesson: {e}")
+            return jsonify({'error': 'Error analyzing lesson'}), 500
+        
+        return jsonify({
+            'success': True,
+            'topics': topics,
+            'detected_quarter': detected_quarter,
+            'detected_subject': primary_topic,
+            'file_name': secure_filename(file.filename)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in mobile_analyze_lesson: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# Helper function to extract text from uploaded files
+def extract_text_from_file(file):
+    """Extract text content from uploaded file (PDF, DOCX, TXT)"""
+    try:
+        filename = secure_filename(file.filename)
+        file_ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else ''
+        
+        if file_ext == 'pdf':
+            # Extract from PDF
+            pdf_reader = PyPDF2.PdfReader(file)
+            text = ''
+            for page in pdf_reader.pages:
+                text += page.extract_text()
+            return text.strip()
+        
+        elif file_ext == 'docx':
+            # Extract from DOCX
+            doc = Document(file)
+            text = '\n'.join([paragraph.text for paragraph in doc.paragraphs])
+            return text.strip()
+        
+        elif file_ext in ['txt', 'text']:
+            # Extract from TXT
+            content = file.read().decode('utf-8', errors='ignore')
+            return content.strip()
+        
+        else:
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error extracting text from file: {e}")
+        return None
+
+
+# --- TEACHER GENERATE QUIZ ROUTE (MOBILE VERSION) ---
+@app.route('/api/mobile/generate-quiz', methods=['POST'])
+def mobile_generate_quiz():
+    """Generate quiz questions from lesson plan (Mobile)"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        num_questions = request.form.get('num_questions', 5, type=int)
+        topic_filter = request.form.get('topic_filter', None)
+        quarter_filter = request.form.get('quarter', None)
+        exclude_questions = request.form.get('exclude_questions', '[]')
+        random_mode = request.form.get('random_mode', 'false').lower() == 'true'
+        
+        if file.filename == '':
+            return jsonify({'error': 'No file selected'}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'File type not allowed'}), 400
+        
+        # Extract text from file
+        lesson_text = extract_text_from_file(file)
+        
+        if not lesson_text:
+            return jsonify({'error': 'Could not extract text from file'}), 400
+        
+        # Generate questions
+        if quiz_generator is None:
+            return jsonify({'error': 'Quiz generator not available'}), 500
+        
+        # Validate that the document is actually a lesson plan
+        try:
+            is_valid_lesson, validation_error = quiz_generator.validate_lesson_plan(lesson_text)
+            if not is_valid_lesson:
+                logger.warning(f"Rejected invalid file: {secure_filename(file.filename)} - Reason: {validation_error}")
+                return jsonify({'error': validation_error, 'rejected': True}), 400
+        except Exception as e:
+            logger.warning(f"Validation check unavailable: {e}")
+        
+        try:
+            # Parse excluded questions
+            import json
+            try:
+                excluded = json.loads(exclude_questions)
+            except:
+                excluded = []
+            
+            # If random_mode is True, skip topic-based filtering and use random selection
+            if random_mode:
+                # In random mode, don't filter by excluded questions - generate fresh random set
+                questions = quiz_generator._get_random_questions(
+                    num_questions=num_questions,
+                    quarter_filter=quarter_filter
+                )
+            else:
+                questions = quiz_generator.find_matching_questions(
+                    lesson_text,
+                    num_questions=num_questions,
+                    topic_filter=topic_filter if topic_filter else None,
+                    quarter_filter=quarter_filter,
+                    exclude_questions=excluded
+                )
+        except Exception as e:
+            logger.error(f"Error generating questions: {e}")
+            return jsonify({'error': 'Error generating quiz'}), 500
+        
+        if not questions:
+            return jsonify({'error': 'No questions could be generated from the lesson'}), 400
+        
+        return jsonify({
+            'success': True,
+            'quiz': questions,
+            'count': len(questions),
+            'detected_quarter': quarter_filter
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in mobile_generate_quiz: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# --- TEACHER LOG QUARTER DETECTION FEEDBACK ROUTE (MOBILE VERSION) ---
+@app.route('/api/mobile/log-quarter-detection', methods=['POST'])
+def mobile_log_quarter_detection():
+    """Log quarter detection feedback for analysis (Mobile)"""
+    try:
+        data = request.get_json()
+        user_id = request.args.get('user_id')  # Mobile sends user_id as query param
+        
+        if not user_id:
+            return jsonify({'error': 'User ID is required'}), 400
+        
+        # Log to database or file for analysis
+        log_data = {
+            'user_id': user_id,
+            'detected_quarter': data.get('detected_quarter'),
+            'is_correct': data.get('is_correct'),
+            'corrected_quarter': data.get('corrected_quarter'),
+            'file_name': data.get('file_name'),
+            'timestamp': data.get('timestamp')
+        }
+        
+        logger.info(f"Quarter detection feedback: {log_data}")
+        
+        # Optionally save to Supabase
+        try:
+            supabase.table('quarter_detection_logs').insert(log_data).execute()
+        except Exception as e:
+            logger.warning(f"Could not log to Supabase: {e}")
+        
+        return jsonify({'success': True})
+        
+    except Exception as e:
+        logger.error(f"Error logging quarter detection: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# --- TEACHER SAVE GENERATED QUIZ ROUTE (MOBILE VERSION) ---
+@app.route('/api/save-generated-quiz', methods=['POST'])
+def save_generated_quiz():
+    """Save temporarily generated quiz to database"""
+    try:
+        data = request.get_json()
+        user_id = session.get('user_id')
+        
+        if not user_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        quiz_data = {
+            'user_id': user_id,
+            'quiz_data': data.get('quiz'),
+            'topic_filter': data.get('topic_filter'),
+            'num_questions': data.get('num_questions'),
+            'expires_at': (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        }
+        
+        result = supabase.table('generated_quizzes').insert(quiz_data).execute()
+        
+        return jsonify({
+            'success': True,
+            'quiz_id': result.data[0]['id'],
+            'message': 'Quiz temporarily saved. You can now assign it to your class.'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error saving generated quiz: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# --- TEACHER CREATE/UPDATE QUIZ ROUTE (MOBILE VERSION) ---
+@app.route('/api/teacher/create-quiz', methods=['POST'])
+def create_teacher_quiz():
+    """Teacher creates and assigns a quiz to their class, or updates an existing quiz"""
+    try:
+        data = request.get_json()
+        
+        logger.info(f"[CREATE_QUIZ] 🎯 REQUEST RECEIVED")
+        logger.info(f"[CREATE_QUIZ] Request body keys: {list(data.keys()) if data else 'NO DATA'}")
+        
+        # Get teacher_id from request body (Flutter sends it explicitly)
+        teacher_id = data.get('teacher_id')
+        
+        logger.info(f"[CREATE_QUIZ] Received teacher_id: {teacher_id}")
+        
+        # ✅ LOG EVERYTHING ABOUT DUE_DATE AT START
+        logger.info(f"[CREATE_QUIZ] 📋 DUE_DATE FROM REQUEST:")
+        logger.info(f"    Key exists: {'due_date' in data}")
+        logger.info(f"    Value: {data.get('due_date')}")
+        logger.info(f"    Type: {type(data.get('due_date'))}")
+        logger.info(f"    Length: {len(str(data.get('due_date'))) if data.get('due_date') else 0}")
+        logger.info(f"    Is None: {data.get('due_date') is None}")
+        logger.info(f"    Is empty string: {data.get('due_date') == ''}")
+        logger.info(f"    Repr: {repr(data.get('due_date'))}")
+
+        
+        if not teacher_id:
+            logger.warning("Quiz creation attempt without teacher_id in request")
+            return jsonify({'error': 'Teacher ID is required'}), 401
+        
+        # Check if this is an update or create
+        quiz_id = data.get('quiz_id')
+        is_update = quiz_id is not None and quiz_id != ''
+        
+        if is_update:
+            logger.info(f"Updating quiz {quiz_id} for teacher {teacher_id}")
+        else:
+            logger.info(f"Creating new quiz for teacher {teacher_id}")
+        
+        # Validate required fields
+        required_fields = ['quiz', 'quiz_title', 'topic', 'quarter', 'grade_level', 'section']
+        missing_fields = [f for f in required_fields if not data.get(f)]
+        if missing_fields:
+            logger.warning(f"[CREATE_QUIZ] Missing fields: {missing_fields}")
+            return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
+        
+        logger.info(f"[CREATE_QUIZ] All required fields present")
+        
+        # Get teacher info
+        teacher = safe_execute(
+            supabase.table('user_info')\
+            .select('first_name', 'last_name')\
+            .eq('id', teacher_id)
+        )
+        
+        if not teacher.data:
+            logger.error(f"Teacher {teacher_id} not found in user_info")
+            return jsonify({'error': 'Teacher not found'}), 404
+            
+        teacher_name = f"{teacher.data[0]['first_name']} {teacher.data[0]['last_name']}"
+        logger.info(f"[CREATE_QUIZ] Teacher found: {teacher_name}")
+        
+        # Verify teacher is assigned to this class
+        logger.info(f"[CREATE_QUIZ] Checking teacher assignment for Grade {data.get('grade_level')} - {data.get('section')}")
+        assignment = safe_execute(
+            supabase.table('teacher_class_assignments')\
+            .select('*')\
+            .eq('teacher_id', teacher_id)\
+            .eq('grade_level', data.get('grade_level'))\
+            .eq('section', data.get('section'))
+        )
+        
+        if not assignment.data:
+            logger.warning(f"Teacher {teacher_id} not assigned to Grade {data.get('grade_level')} - {data.get('section')}")
+            return jsonify({'error': 'You are not assigned to this class'}), 403
+        
+        logger.info(f"[CREATE_QUIZ] Teacher is assigned to this class")
+        
+        # Validate quiz data
+        quiz_items = data.get('quiz', [])
+        if not quiz_items or len(quiz_items) == 0:
+            logger.warning(f"[CREATE_QUIZ] No questions provided")
+            return jsonify({'error': 'Quiz must contain at least one question'}), 400
+        
+        logger.info(f"[CREATE_QUIZ] Quiz has {len(quiz_items)} questions")
+        
+        # Calculate total points
+        total_items = len(quiz_items)
+        points_per_item = int(data.get('points_per_item', 1))
+        time_limit = int(data.get('time_limit', 30))
+        
+        logger.info(f"[CREATE_QUIZ] Points per item: {points_per_item}, Time limit: {time_limit}")
+        
+        # Validate point and time values
+        if points_per_item < 1 or points_per_item > 10:
+            return jsonify({'error': 'Points per item must be between 1 and 10'}), 400
+        
+        if time_limit < 1 or time_limit > 180:
+            return jsonify({'error': 'Time limit must be between 1 and 180 minutes'}), 400
+        
+        total_points = total_items * points_per_item
+        
+        # Convert quarter from Q1, Q2, Q3, Q4 format to "1st Quarter", "2nd Quarter", etc. (BEFORE cleaning quiz data)
+        quarter_str = data.get('quarter', '').strip()
+        quarter_mapping = {
+            'Q1': '1st Quarter',
+            'Q2': '2nd Quarter',
+            'Q3': '3rd Quarter',
+            'Q4': '4th Quarter'
+        }
+        if quarter_str in quarter_mapping:
+            quarter_str = quarter_mapping[quarter_str]
+            logger.info(f"[CREATE_QUIZ] Converted quarter: {data.get('quarter')} → {quarter_str}")
+        else:
+            logger.warning(f"[CREATE_QUIZ] Unknown quarter format: {quarter_str}")
+            quarter_str = data.get('quarter', '')
+        
+        # Convert due_date - handle both ISO format and dd/mm/yyyy format
+        # ✅ IMPORTANT: Keep in ISO 8601 format for Supabase timestamptz
+        from datetime import datetime
+        due_date_str = data.get('due_date')
+        
+        logger.info(f"[CREATE_QUIZ] 🔄 STARTING DUE_DATE CONVERSION")
+        logger.info(f"    Input: {repr(due_date_str)}")
+        
+        if due_date_str and str(due_date_str).strip():
+            try:
+                logger.info(f"[CREATE_QUIZ] Raw due_date received: {due_date_str} (type: {type(due_date_str)})")
+                
+                # Try ISO format first (2026-04-20T15:30:00.000 or 2026-04-20T15:30:00)
+                if 'T' in str(due_date_str):
+                    logger.info(f"[CREATE_QUIZ] 🔍 Detected ISO format, parsing...")
+                    due_date_obj = datetime.fromisoformat(str(due_date_str).split('.')[0])  # Remove milliseconds if present
+                    # ✅ KEEP IN ISO 8601 FORMAT FOR SUPABASE
+                    due_date_str = due_date_obj.isoformat()
+                    logger.info(f"[CREATE_QUIZ] ✅ ISO parsed successfully: {due_date_str}")
+                else:
+                    # Try M/D/YYYY format (from Flutter date picker)
+                    logger.info(f"[CREATE_QUIZ] 🔍 Detected non-ISO format, trying M/D/YYYY...")
+                    try:
+                        due_date_obj = datetime.strptime(str(due_date_str), '%m/%d/%Y')
+                        logger.info(f"[CREATE_QUIZ] ✅ M/D/YYYY parsed successfully")
+                    except:
+                        # Try dd/mm/yyyy format as fallback (legacy)
+                        logger.info(f"[CREATE_QUIZ] 🔍 M/D/YYYY failed, trying dd/mm/yyyy...")
+                        due_date_obj = datetime.strptime(str(due_date_str), '%d/%m/%Y')
+                        logger.info(f"[CREATE_QUIZ] ✅ dd/mm/yyyy parsed successfully")
+                    # ✅ CONVERT TO ISO WITH TIME SET TO MIDNIGHT
+                    due_date_str = due_date_obj.isoformat()
+                    logger.info(f"[CREATE_QUIZ] ✅ Date to ISO: {due_date_str}")
+            except Exception as e:
+                logger.error(f"[CREATE_QUIZ] ❌ Error converting due_date '{due_date_str}': {e}", exc_info=True)
+                # ✅ FALLBACK: Use current datetime instead of NULL
+                due_date_str = datetime.now().isoformat()
+                logger.warning(f"[CREATE_QUIZ] ⚠️ Using current datetime as fallback: {due_date_str}")
+        else:
+            logger.warning(f"[CREATE_QUIZ] ⚠️ No due_date provided in request (received: {repr(due_date_str)})")
+            # ✅ FALLBACK: Use current datetime instead of NULL
+            due_date_str = datetime.now().isoformat()
+            logger.warning(f"[CREATE_QUIZ] ⚠️ Using current datetime as fallback: {due_date_str}")
+        
+        logger.info(f"[CREATE_QUIZ] ✅ FINAL DUE_DATE TO SAVE: {due_date_str}")
+
+        due_date_display = due_date_str
+        try:
+            due_date_display = datetime.fromisoformat(str(due_date_str).replace('Z', '+00:00')).strftime('%B %d, %Y')
+        except Exception:
+            try:
+                due_date_display = parser.parse(str(due_date_str)).strftime('%B %d, %Y')
+            except Exception:
+                pass
+        
+        # Clean up quiz data for storage (now using converted quarter)
+        cleaned_quiz = []
+        for q in quiz_items:
+            cleaned_q = {
+                'question': q.get('question'),
+                'correct_answer': int(q.get('correct_answer', 0)),
+                'choices': q.get('choices', []),
+                'topic': q.get('topic', ''),
+                'quarter': quarter_str,
+                'grade': q.get('grade', data.get('grade_level', '7'))
+            }
+            cleaned_quiz.append(cleaned_q)
+        
+        logger.info(f"[CREATE_QUIZ] Quiz data cleaned and ready")
+        
+        # Create quiz record for database
+        quiz_record = {
+            'teacher_id': teacher_id,
+            'teacher_name': teacher_name,
+            'quiz_title': data.get('quiz_title'),
+            'topic': data.get('topic'),
+            'quarter': quarter_str,
+            'grade_level': data.get('grade_level'),
+            'section': data.get('section'),
+            'total_items': total_items,
+            'total_points': total_points,
+            'points_per_item': points_per_item,
+            'time_limit_minutes': time_limit,
+            'instructions': data.get('instructions', ''),
+            'quiz_data': cleaned_quiz,
+            'due_date': due_date_str,
+            'status': 'active'
+        }
+        
+        # ✅ DEBUG: Log the quiz record before saving
+        logger.info(f"[CREATE_QUIZ] ✅ FINAL QUIZ RECORD TO SAVE:")
+        logger.info(f"  Title: {quiz_record['quiz_title']}")
+        logger.info(f"  Due Date: {quiz_record['due_date']}")
+        logger.info(f"  Grade Level: {quiz_record['grade_level']}")
+        logger.info(f"  Section: {quiz_record['section']}")
+        logger.info(f"  Topic: {quiz_record['topic']}")
+        logger.info(f"  Time Limit: {quiz_record['time_limit_minutes']} mins")
+        logger.info(f"  Total Items: {quiz_record['total_items']}")
+        logger.info(f"  Total Points: {quiz_record['total_points']}")
+        logger.info(f"  All record keys: {quiz_record.keys()}")
+        
+        if is_update:
+            # Verify the quiz belongs to this teacher
+            existing_quiz = safe_execute(
+                supabase.table('teacher_quizzes')\
+                .select('*')\
+                .eq('id', quiz_id)\
+                .eq('teacher_id', teacher_id)
+            )
+            
+            if not existing_quiz.data:
+                logger.warning(f"Quiz {quiz_id} not found or doesn't belong to teacher {teacher_id}")
+                return jsonify({'error': 'Quiz not found or you do not have permission to edit it'}), 404
+            
+            # Update the existing quiz
+            logger.info(f"Updating quiz: {quiz_record['quiz_title']} with {total_items} questions")
+            result = safe_execute(
+                supabase.table('teacher_quizzes')\
+                .update(quiz_record)\
+                .eq('id', quiz_id)\
+                .eq('teacher_id', teacher_id)
+            )
+            
+            if not result.data:
+                logger.error(f"Failed to update quiz record. Response: {result}")
+                return jsonify({'error': 'Failed to update quiz in database'}), 500
+            
+            logger.info(f"Quiz updated successfully with ID: {quiz_id}")
+            
+            return jsonify({
+                'success': True,
+                'quiz_id': quiz_id,
+                'message': f'Quiz "{quiz_record["quiz_title"]}" updated successfully for Grade {quiz_record["grade_level"]} - {quiz_record["section"]}',
+                'total_points': total_points,
+                'time_limit': time_limit
+            }), 200
+        else:
+            # Create new quiz
+            logger.info(f"Inserting new quiz: {quiz_record['quiz_title']} with {total_items} questions")
+            logger.info(f"[CREATE_QUIZ] 🔍 About to insert with due_date: {quiz_record.get('due_date')}")
+            
+            result = safe_execute(
+                supabase.table('teacher_quizzes').insert(quiz_record)
+            )
+            
+            logger.info(f"[CREATE_QUIZ] 📤 Insert result type: {type(result)}")
+            logger.info(f"[CREATE_QUIZ] 📤 Insert result: {result}")
+            
+            if not result.data:
+                logger.error(f"[CREATE_QUIZ] ❌ Failed to insert quiz record. Response: {result}")
+                return jsonify({'error': 'Failed to save quiz to database'}), 500
+            
+            quiz_id = result.data[0]['id']
+            logger.info(f"[CREATE_QUIZ] ✅ Quiz created successfully with ID: {quiz_id}")
+            
+            # ✅ VERIFY: Read back the quiz from database to confirm due_date was saved
+            try:
+                verify_result = safe_execute(
+                    supabase.table('teacher_quizzes')\
+                    .select('id, quiz_title, due_date')\
+                    .eq('id', quiz_id)
+                )
+                if verify_result.data:
+                    saved_quiz = verify_result.data[0]
+                    logger.info(f"[CREATE_QUIZ] ✅ VERIFICATION - Quiz saved in DB:")
+                    logger.info(f"    ID: {saved_quiz.get('id')}")
+                    logger.info(f"    Title: {saved_quiz.get('quiz_title')}")
+                    logger.info(f"    Due Date in DB: {saved_quiz.get('due_date')}")
+                else:
+                    logger.warning(f"[CREATE_QUIZ] ⚠️ Could not verify saved quiz")
+            except Exception as ve:
+                logger.error(f"[CREATE_QUIZ] ❌ Verification failed: {ve}")
+            
+            # ✅ ADD ENTRIES TO NOTIFICATIONS TABLE FOR STUDENTS
+            try:
+                # Get all students in this grade/section
+                students_resp = safe_execute(
+                    supabase.table('task_assignments')\
+                    .select('student_id, user_info!task_assignments_student_id_fkey(first_name, last_name)')\
+                    .eq('grade_level', data.get('grade_level'))\
+                    .eq('section', data.get('section'))
+                )
+                
+                if students_resp.data:
+                    for student_record in students_resp.data:
+                        student_id = student_record.get('student_id')
+                        student_info = student_record.get('user_info')
+                        if student_info:
+                            student_name = f"{student_info.get('first_name', '')} {student_info.get('last_name', '')}"
+                        else:
+                            student_name = f"Student {student_id}"
+                        
+                        # Check if notification already exists for this quiz
+                        existing_notif = safe_execute(
+                            supabase.table('notifications')\
+                            .select('notif_id')\
+                            .eq('user_id', student_id)\
+                            .eq('sender_id', teacher_id)\
+                            .ilike('message', f'%{quiz_record["quiz_title"]}%')
+                        )
+                        
+                        if not existing_notif.data:
+                            # Create notification for this student only if it doesn't exist
+                            notification = {
+                                'user_id': student_id,
+                                'sender_id': teacher_id,
+                                'title': 'New Quiz Available',
+                                'message': f"Teacher {teacher_name} assigned a new quiz: {quiz_record['quiz_title']} - Due: {due_date_display}",
+                                'notif_type': 'Quiz',
+                                'status': 'Unread'
+                            }
+                            safe_execute(supabase.table('notifications').insert(notification))
+                    
+                    logger.info(f"[CREATE_QUIZ] Created notifications for {len(students_resp.data)} students")
+            except Exception as e:
+                logger.warning(f"[CREATE_QUIZ] Error creating notifications: {e}")
+            
+            return jsonify({
+                'success': True,
+                'quiz_id': quiz_id,
+                'message': f'Quiz "{quiz_record["quiz_title"]}" created for Grade {quiz_record["grade_level"]} - {quiz_record["section"]}',
+                'total_points': total_points,
+                'time_limit': time_limit
+            }), 201
+        
+    except Exception as e:
+        logger.error(f"Error creating/updating quiz: {str(e)}", exc_info=True)
+        return jsonify({
+            'error': 'Failed to save quiz',
+            'details': str(e)
+        }), 500
+
+
+#--- TEACHER GET MY QUIZZES ROUTE QUIZ PAGE SECTION (MOBILE VERSION) ---
+@app.route('/api/teacher/my-quizzes', methods=['GET'])
+def get_my_quizzes():
+    """Get all quizzes created by the current teacher"""
+    try:
+        # Get teacher_id from query parameter
+        teacher_id = request.args.get('teacher_id')
+        
+        if not teacher_id:
+            logger.warning("GET my-quizzes: No teacher_id provided")
+            return jsonify({'error': 'Teacher ID is required'}), 400
+        
+        logger.info(f"[GET_MY_QUIZZES] Fetching quizzes for teacher_id: {teacher_id}")
+        
+        grade_filter = request.args.get('grade_level')
+        section_filter = request.args.get('section')
+        
+        query = supabase.table('teacher_quizzes')\
+            .select('*')\
+            .eq('teacher_id', teacher_id)\
+            .order('created_at', desc=True)
+        
+        if grade_filter:
+            query = query.eq('grade_level', grade_filter)
+        
+        if section_filter:
+            query = query.eq('section', section_filter)
+        
+        result = query.execute()
+        logger.info(f"[GET_MY_QUIZZES] Query executed. Result type: {type(result)}, Has data: {hasattr(result, 'data')}")
+        
+        # Format the response and add submission counts
+        quizzes = []
+        quiz_rows = result.data if result and hasattr(result, 'data') and result.data else []
+        logger.info(f"[GET_MY_QUIZZES] Found {len(quiz_rows)} quizzes")
+        
+        for quiz_row in quiz_rows:
+            # Create a fresh dictionary for each quiz
+            quiz_output = {
+                'id': quiz_row.get('id'),
+                'teacher_id': quiz_row.get('teacher_id'),
+                'teacher_name': quiz_row.get('teacher_name'),
+                'quiz_title': quiz_row.get('quiz_title'),
+                'topic': quiz_row.get('topic'),
+                'quarter': quiz_row.get('quarter'),
+                'grade_level': quiz_row.get('grade_level'),
+                'section': quiz_row.get('section'),
+                'total_items': quiz_row.get('total_items'),
+                'total_points': quiz_row.get('total_points'),
+                'points_per_item': quiz_row.get('points_per_item'),
+                'time_limit_minutes': quiz_row.get('time_limit_minutes'),
+                'instructions': quiz_row.get('instructions'),
+                'due_date': quiz_row.get('due_date'),
+                'status': quiz_row.get('status'),
+                'created_at': quiz_row.get('created_at'),
+                'updated_at': quiz_row.get('updated_at'),
+            }
+            
+            # Get submission count for this quiz
+            try:
+                submissions = supabase.table('student_quiz_results')\
+                    .select('*', count='exact')\
+                    .eq('teacher_quiz_id', quiz_output['id'])\
+                    .execute()
+                quiz_output['submission_count'] = submissions.count if hasattr(submissions, 'count') else 0
+            except Exception as e:
+                logger.warning(f"[GET_MY_QUIZZES] Could not get submission count: {e}")
+                quiz_output['submission_count'] = 0
+            
+            # Get total students in the class
+            try:
+                class_students = supabase.table('user_info')\
+                    .select('id', count='exact')\
+                    .eq('role', 'Student')\
+                    .eq('year_level', quiz_output['grade_level'])\
+                    .eq('section', quiz_output['section'])\
+                    .execute()
+                quiz_output['total_students'] = class_students.count if hasattr(class_students, 'count') else 0
+            except Exception as e:
+                logger.warning(f"[GET_MY_QUIZZES] Could not get total students: {e}")
+                quiz_output['total_students'] = 0
+            
+            # Calculate question count from quiz_data and include quiz questions
+            quiz_data = quiz_row.get('quiz_data', [])
+            
+            question_count = 0
+            parsed_quiz_data = []
+            
+            if quiz_data:
+                if isinstance(quiz_data, str):
+                    try:
+                        parsed_quiz_data = json.loads(quiz_data)
+                        question_count = len(parsed_quiz_data) if parsed_quiz_data else 0
+                    except Exception:
+                        question_count = 0
+                        parsed_quiz_data = []
+                elif isinstance(quiz_data, list):
+                    parsed_quiz_data = quiz_data
+                    question_count = len(quiz_data)
+            
+            quiz_output['question_count'] = question_count
+            quiz_output['quiz'] = parsed_quiz_data  # ✅ ADD quiz data for display
+            
+            logger.info(f"[GET_MY_QUIZZES] Quiz '{quiz_output['quiz_title']}':")
+            logger.info(f"    due_date from DB: {quiz_row.get('due_date')}")
+            logger.info(f"    due_date in output: {quiz_output.get('due_date')}")
+            
+            # ✅ NORMALIZE due_date format to ISO 8601 for Flutter
+            if quiz_output.get('due_date'):
                 try:
-                    task_record = result.data[i]
-                    assigned_task_id = task_record.get('task_id')
-                    safe_execute(supabase.table('notifications').insert({
+                    due_date_raw = str(quiz_output.get('due_date'))
+                    # Parse the date (handle both ISO and Supabase timestamp formats)
+                    if 'T' in due_date_raw:
+                        # Already ISO format
+                        due_dt = datetime.fromisoformat(due_date_raw.split('.')[0].split('+')[0])
+                    else:
+                        # Supabase format like "2026-03-26 20:27:00+00" or "2026-03-26 20:27:00"
+                        # Extract just the datetime part before the timezone
+                        date_part = due_date_raw.split('+')[0].split('Z')[0].strip()
+                        due_dt = datetime.strptime(date_part, '%Y-%m-%d %H:%M:%S')
+                    # Convert to ISO format
+                    quiz_output['due_date'] = due_dt.isoformat()
+                    logger.info(f"    due_date normalized: {quiz_output['due_date']}")
+                except Exception as e:
+                    logger.warning(f"[GET_MY_QUIZZES] Could not normalize due_date: {e}")
+            
+            # Set time_limit
+            time_limit_value = quiz_output.get('time_limit_minutes')
+            if time_limit_value is not None:
+                try:
+                    quiz_output['time_limit'] = int(time_limit_value)
+                except (ValueError, TypeError):
+                    quiz_output['time_limit'] = 30
+            else:
+                quiz_output['time_limit'] = 30
+            
+            # Set points_per_item
+            points_per_item_value = quiz_output.get('points_per_item')
+            if points_per_item_value:
+                quiz_output['points_per_item'] = int(points_per_item_value)
+            else:
+                quiz_output['points_per_item'] = 1
+            
+            # Set total_points
+            total_points_value = quiz_output.get('total_points')
+            if total_points_value:
+                quiz_output['total_points'] = int(total_points_value)
+            else:
+                quiz_output['total_points'] = question_count * quiz_output['points_per_item']
+            
+            quizzes.append(quiz_output)
+        
+        logger.info(f"[GET_MY_QUIZZES] ✅ FINAL RESPONSE - {len(quizzes)} quizzes:")
+        for q in quizzes:
+            logger.info(f"    {q['quiz_title']}: due_date={q.get('due_date')}")
+        
+        return jsonify({
+            'success': True,
+            'quizzes': quizzes,
+            'count': len(quizzes)
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"[GET_MY_QUIZZES] ❌ Error: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e), 'type': type(e).__name__}), 500
+
+
+#--- DEBUG ENDPOINT TO CHECK LATEST QUIZ DUE_DATE FOR A TEACHER ---
+@app.route('/api/debug/latest-quiz-due-date', methods=['GET'])
+def debug_latest_quiz():
+    """Debug endpoint to verify due_date is being saved"""
+    try:
+        teacher_id = request.args.get('teacher_id')
+        if not teacher_id:
+            return jsonify({'error': 'teacher_id required'}), 400
+        
+        result = supabase.table('teacher_quizzes')\
+            .select('id, quiz_title, due_date, created_at')\
+            .eq('teacher_id', teacher_id)\
+            .order('created_at', desc=True)\
+            .limit(1)\
+            .execute()
+        
+        if result.data:
+            quiz = result.data[0]
+            logger.info(f"[DEBUG] Latest quiz due_date: {quiz['due_date']}")
+            return jsonify({
+                'quiz_id': quiz['id'],
+                'title': quiz['quiz_title'],
+                'due_date': quiz['due_date'],
+                'due_date_type': str(type(quiz['due_date'])),
+                'created_at': quiz['created_at']
+            }), 200
+        else:
+            return jsonify({'error': 'No quizzes found'}), 404
+    except Exception as e:
+        logger.error(f"[DEBUG] Error: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+#--- TEACHER GET ALL QUIZ RESULTS ROUTE (MOBILE VERSION) ---
+@app.route('/api/quiz/all/results', methods=['GET'])
+def get_all_quiz_results():
+    """Get all quiz results for teacher, optionally filtered by grade/section"""
+    try:
+        teacher_id = request.args.get('teacher_id') or session.get('user_id')
+        grade_level = request.args.get('grade_level')
+        section = request.args.get('section')
+        
+        if not teacher_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        # Build query for quiz results
+        query = supabase.table('student_quiz_results')\
+            .select('*')\
+            .eq('teacher_id', teacher_id)
+        
+        if grade_level:
+            query = query.eq('grade_level', grade_level)
+        if section:
+            query = query.eq('section', section)
+        
+        results = query.order('submitted_date', desc=True).execute()
+        
+        # Get quiz details for context
+        quiz_query = supabase.table('teacher_quizzes')\
+            .select('*')\
+            .eq('teacher_id', teacher_id)
+        
+        quizzes = quiz_query.execute()
+        
+        # Enhance results with quiz info
+        enhanced_results = []
+        for result in results.data if results.data else []:
+            # Find matching quiz details
+            quiz_info = None
+            for quiz in quizzes.data if quizzes.data else []:
+                if quiz['id'] == result.get('teacher_quiz_id'):
+                    quiz_info = quiz
+                    break
+            
+            enhanced_result = dict(result)
+            if quiz_info:
+                enhanced_result['quiz_title'] = quiz_info.get('quiz_title', 'Untitled')
+                enhanced_result['total_points'] = quiz_info.get('total_points', result.get('total_items', 1))
+            
+            enhanced_results.append(enhanced_result)
+        
+        return jsonify({
+            'success': True,
+            'results': enhanced_results,
+            'quizzes': quizzes.data if quizzes.data else []
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching all quiz results: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+
+
+#✅ CHECK IF QUIZ CAN BE EDITED (NO SUBMISSIONS) - USED FOR BOTH CREATE AND UPDATE FLOW
+@app.route('/api/quiz/<int:quiz_id>/can-edit', methods=['GET'])
+def check_quiz_editable(quiz_id):
+    """Check if a quiz can be edited (has no submissions)"""
+    try:
+        # Get teacher_id from query parameter or session
+        teacher_id = request.args.get('teacher_id') or session.get('user_id')
+        
+        if not teacher_id:
+            logger.warning(f"[CAN_EDIT] No teacher_id provided for quiz {quiz_id}")
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        logger.info(f"[CAN_EDIT] Checking quiz {quiz_id} for teacher {teacher_id}")
+        
+        # Check if quiz exists and belongs to teacher
+        quiz_result = safe_execute(
+            supabase.table('teacher_quizzes')\
+            .select('teacher_id')\
+            .eq('id', quiz_id)\
+            .single()
+        )
+        
+        if not quiz_result or not quiz_result.data:
+            logger.warning(f"[CAN_EDIT] Quiz {quiz_id} not found")
+            return jsonify({
+                'success': False,
+                'can_edit': False,
+                'submission_count': 0,
+                'reason': 'Quiz not found'
+            }), 200
+        
+        if int(quiz_result.data['teacher_id']) != int(teacher_id):
+            logger.warning(f"[CAN_EDIT] Access denied: quiz belongs to teacher {quiz_result.data['teacher_id']}, not {teacher_id}")
+            return jsonify({
+                'success': False,
+                'can_edit': False,
+                'submission_count': 0,
+                'reason': 'Access denied'
+            }), 200
+        
+        # Check for submissions
+        submissions_result = safe_execute(
+            supabase.table('student_quiz_results')\
+            .select('*', count='exact')\
+            .eq('teacher_quiz_id', quiz_id)
+        )
+        
+        submission_count = submissions_result.count if hasattr(submissions_result, 'count') else len(submissions_result.data) if submissions_result.data else 0
+        
+        can_edit = submission_count == 0
+        logger.info(f"[CAN_EDIT] Quiz {quiz_id}: {submission_count} submissions, can_edit={can_edit}")
+        
+        return jsonify({
+            'success': True,
+            'can_edit': can_edit,
+            'submission_count': submission_count
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"[CAN_EDIT] Error checking quiz edit status for quiz {quiz_id}: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'can_edit': False,
+            'error': str(e)
+        }), 200
+
+
+#✅ TEACHER GET CLASS RESULTS ROUTE (MOBILE VERSION)
+@app.route('/api/teacher/class-results', methods=['GET'])
+def get_class_results():
+    """Teacher views results for their class"""
+    try:
+        # Try session first, then query parameter fallback
+        teacher_id = session.get('user_id') or request.args.get('teacher_id')
+        grade_level = request.args.get('grade_level')
+        section = request.args.get('section')
+        quiz_id = request.args.get('quiz_id')  # Optional specific quiz
+        
+        if not teacher_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        # Build query
+        query = supabase.table('student_quiz_results')\
+            .select('*')\
+            .eq('teacher_id', teacher_id)
+        
+        if grade_level:
+            query = query.eq('grade_level', grade_level)
+        if section:
+            query = query.eq('section', section)
+        if quiz_id:
+            query = query.eq('teacher_quiz_id', quiz_id)
+        
+        results = query.order('submitted_date', desc=True).execute()
+        
+        # Get quiz details for context
+        quiz_query = supabase.table('teacher_quizzes')\
+            .select('*')\
+            .eq('teacher_id', teacher_id)
+        
+        if quiz_id:
+            quiz_query = quiz_query.eq('id', quiz_id)
+        
+        quizzes = quiz_query.execute()
+        
+        return jsonify({
+            'success': True,
+            'results': results.data if results.data else [],
+            'quizzes': quizzes.data if quizzes.data else []
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching class results: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+
+#✅ TEACHER GET STUDENT PERFORMANCE ROUTE (MOBILE VERSION)
+@app.route('/api/teacher/student-performance/<int:student_id>', methods=['GET'])
+def get_student_performance(student_id):
+    """Get detailed performance of a specific student"""
+    try:
+        teacher_id = session.get('user_id')
+        
+        if not teacher_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        # Get student info
+        student = supabase.table('user_info')\
+            .select('first_name', 'last_name', 'year_level', 'section')\
+            .eq('id', student_id)\
+            .execute()
+        
+        if not student.data:
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # Get all quiz results for this student under this teacher
+        results = supabase.table('student_quiz_results')\
+            .select('*')\
+            .eq('student_id', student_id)\
+            .eq('teacher_id', teacher_id)\
+            .order('submitted_date', desc=True)\
+            .execute()
+        
+        # Calculate topic-wise performance
+        topic_performance = {}
+        for r in results.data if results.data else []:
+            if r['topic'] not in topic_performance:
+                topic_performance[r['topic']] = {
+                    'topic': r['topic'],
+                    'quizzes_taken': 0,
+                    'total_score': 0,
+                    'total_items': 0,
+                    'average_percentage': 0
+                }
+            
+            topic_performance[r['topic']]['quizzes_taken'] += 1
+            topic_performance[r['topic']]['total_score'] += r['score']
+            topic_performance[r['topic']]['total_items'] += r['total_items']
+            
+        # Calculate averages
+        for topic in topic_performance.values():
+            topic['average_percentage'] = (topic['total_score'] / topic['total_items'] * 100) if topic['total_items'] > 0 else 0
+        
+        # Calculate overall statistics
+        total_quizzes = len(results.data) if results.data else 0
+        if total_quizzes > 0:
+            total_score = sum(r['score'] for r in results.data)
+            total_items = sum(r['total_items'] for r in results.data)
+            overall_average = (total_score / total_items * 100) if total_items > 0 else 0
+        else:
+            overall_average = 0
+        
+        return jsonify({
+            'success': True,
+            'student': {
+                'name': f"{student.data[0]['first_name']} {student.data[0]['last_name']}",
+                'grade_level': student.data[0]['year_level'],
+                'section': student.data[0]['section']
+            },
+            'quiz_history': results.data if results.data else [],
+            'topic_performance': list(topic_performance.values()),
+            'overall_average': overall_average,
+            'total_quizzes': total_quizzes
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching student performance: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+#--TEACHER GET QUIZ DETAILS ROUTE (MOBILE VERSION)
+@app.route('/api/quiz/<int:quiz_id>', methods=['GET'])
+def get_quiz_details(quiz_id):
+    """Get details of a specific quiz"""
+    try:
+        user_id = session.get('user_id')
+        
+        if not user_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        quiz = supabase.table('teacher_quizzes')\
+            .select('*')\
+            .eq('id', quiz_id)\
+            .execute()
+        
+        if not quiz.data:
+            return jsonify({'error': 'Quiz not found'}), 404
+        
+        return jsonify({
+            'success': True,
+            'quiz': quiz.data[0]
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching quiz details: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+#--TEACHER GET QUIZ RESULTS ROUTE (MOBILE VERSION) - INCLUDES RETAKE ALLOWED INFO
+@app.route('/api/quiz/<int:quiz_id>/results', methods=['GET'])
+def get_quiz_results(quiz_id):
+    """Get all results for a specific quiz"""
+    try:
+        teacher_id = session.get('user_id')
+        
+        if not teacher_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        # Get quiz details
+        quiz = supabase.table('teacher_quizzes')\
+            .select('*')\
+            .eq('id', quiz_id)\
+            .eq('teacher_id', teacher_id)\
+            .execute()
+        
+        if not quiz.data:
+            return jsonify({'error': 'Quiz not found or access denied'}), 404
+        
+        quiz_data = quiz.data[0]
+        quiz_title = quiz_data.get('quiz_title', '')
+        
+        # Get all results for this quiz
+        results = supabase.table('student_quiz_results')\
+            .select('*')\
+            .eq('teacher_quiz_id', quiz_id)\
+            .order('submitted_date', desc=True)\
+            .execute()
+        
+        # Get all retake allowed notifications for all quizzes
+        retake_allowed_notifications = supabase.table('notifications')\
+            .select('user_id, message')\
+            .eq('title', 'Quiz Retake Allowed')\
+            .execute()
+        
+        # Build a set of student IDs who have been allowed to retake THIS specific quiz
+        retake_allowed_students = set()
+        if retake_allowed_notifications.data and quiz_title:
+            for notif in retake_allowed_notifications.data:
+                # Check if this notification mentions this specific quiz
+                if quiz_title in notif.get('message', ''):
+                    retake_allowed_students.add(notif['user_id'])
+        
+        # Enhance results with total_points from quiz data and retake_allowed flag
+        enhanced_results = []
+        if results.data:
+            for result in results.data:
+                # Calculate total_points from quiz if not in result
+                total_points = result.get('total_points') or quiz_data.get('total_points') or (result.get('total_items', 1) * quiz_data.get('points_per_item', 1))
+                result['total_points'] = total_points
+                
+                # Check if teacher has sent retake allowed notification for this student/quiz
+                result['retake_allowed_by_teacher'] = result['student_id'] in retake_allowed_students
+                
+                enhanced_results.append(result)
+        
+        return jsonify({
+            'success': True,
+            'quiz': quiz_data,
+            'results': enhanced_results
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching quiz results: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+#--TEACHER GET NON-SUBMITTED STUDENTS ROUTE (MOBILE VERSION) - USED FOR REMINDERS
+@app.route('/api/quiz/<int:quiz_id>/non-submitted', methods=['GET'])
+def get_non_submitted_students(quiz_id):
+    """Get list of students who haven't submitted the quiz"""
+    try:
+        teacher_id = session.get('user_id')
+        
+        if not teacher_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        # Get quiz details
+        quiz = supabase.table('teacher_quizzes')\
+            .select('grade_level, section, quiz_title')\
+            .eq('id', quiz_id)\
+            .eq('teacher_id', teacher_id)\
+            .execute()
+        
+        if not quiz.data:
+            return jsonify({'error': 'Quiz not found or access denied'}), 404
+        
+        quiz_data = quiz.data[0]
+        
+        # Get all students in the class
+        class_students = supabase.table('user_info')\
+            .select('id, first_name, last_name')\
+            .eq('role', 'Student')\
+            .eq('year_level', quiz_data['grade_level'])\
+            .eq('section', quiz_data['section'])\
+            .order('first_name', desc=False)\
+            .execute()
+        
+        # Get students who have submitted
+        submitted = supabase.table('student_quiz_results')\
+            .select('student_id')\
+            .eq('teacher_quiz_id', quiz_id)\
+            .execute()
+        
+        submitted_ids = [s['student_id'] for s in submitted.data] if submitted.data else []
+        
+        # Filter for non-submitted students
+        non_submitted = [s for s in class_students.data if s['id'] not in submitted_ids]
+        
+        return jsonify({
+            'success': True,
+            'quiz_title': quiz_data['quiz_title'],
+            'submitted_count': len(submitted_ids),
+            'total_students': len(class_students.data) if class_students.data else 0,
+            'non_submitted_students': non_submitted
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching non-submitted students: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+#-- HELPER FUNCTION: Check if student was reminded recently for this quiz
+def was_student_reminded_recently(student_id, quiz_id, hours=24):
+    """Check if a student was reminded about this quiz in the last N hours"""
+    try:
+        # Get Philippines timezone
+        from pytz import timezone as tz
+        philippines_tz = tz('Asia/Manila')
+        cutoff_time = datetime.now(philippines_tz) - timedelta(hours=hours)
+        
+        result = supabase.table('quiz_reminder_history')\
+            .select('id')\
+            .eq('student_id', student_id)\
+            .eq('quiz_id', quiz_id)\
+            .gte('reminded_at', cutoff_time.isoformat())\
+            .execute()
+        
+        return len(result.data) > 0 if result.data else False
+    except Exception as e:
+        logger.warning(f"Error checking reminder history: {e}")
+        return False
+
+
+#-- HELPER FUNCTION: Record a reminder in the history table
+def record_reminder(student_id, quiz_id, teacher_id, reminder_type, message):
+    """Record a reminder in the history table"""
+    try:
+        from pytz import timezone as tz
+        philippines_tz = tz('Asia/Manila')
+        reminder_record = {
+            'student_id': student_id,
+            'quiz_id': quiz_id,
+            'teacher_id': teacher_id,
+            'reminder_type': reminder_type,
+            'message': message,
+            'reminded_at': datetime.now(philippines_tz).isoformat()
+        }
+        supabase.table('quiz_reminder_history').insert(reminder_record).execute()
+        return True
+    except Exception as e:
+        logger.warning(f"Error recording reminder: {e}")
+        return False
+
+
+#--TEACHER SEND QUIZ REMINDER ROUTE (MOBILE VERSION) - CAN REMIND ALL OR INDIVIDUAL STUDENT
+@app.route('/api/send-quiz-reminder', methods=['POST'])
+def send_quiz_reminder():
+    """Send a reminder notification to student about pending quiz"""
+    try:
+        data = request.get_json()
+        # Try session first, then request body fallback
+        teacher_id = session.get('user_id') or data.get('teacher_id')
+        
+        if not teacher_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        student_id = data.get('student_id')
+        quiz_id = data.get('quiz_id')
+        message = data.get('message')
+        remind_all = data.get('remind_all', False)
+        
+        # Get teacher info
+        teacher = supabase.table('user_info')\
+            .select('first_name', 'last_name', 'role')\
+            .eq('id', teacher_id)\
+            .execute()
+        
+        if not teacher.data:
+            return jsonify({'error': 'Teacher not found'}), 404
+            
+        teacher_name = f"{teacher.data[0]['first_name']} {teacher.data[0]['last_name']}"
+        teacher_role = teacher.data[0]['role']
+        
+        # Get quiz details
+        quiz = supabase.table('teacher_quizzes')\
+            .select('quiz_title, grade_level, section')\
+            .eq('id', quiz_id)\
+            .execute()
+        
+        if not quiz.data:
+            return jsonify({'error': 'Quiz not found'}), 404
+            
+        quiz_data = quiz.data[0]
+        
+        # Get the assignment_id from teacher_class_assignments
+        assignment = supabase.table('teacher_class_assignments')\
+            .select('assignment_id')\
+            .eq('teacher_id', teacher_id)\
+            .eq('grade_level', quiz_data['grade_level'])\
+            .eq('section', quiz_data['section'])\
+            .execute()
+        
+        assignment_id = assignment.data[0]['assignment_id'] if assignment.data else None
+        
+        if remind_all:
+            # Get all students in the class who haven't submitted
+            class_students = supabase.table('user_info')\
+                .select('id, first_name, last_name')\
+                .eq('role', 'Student')\
+                .eq('year_level', quiz_data['grade_level'])\
+                .eq('section', quiz_data['section'])\
+                .execute()
+            
+            # Get students who have already submitted
+            submitted = supabase.table('student_quiz_results')\
+                .select('student_id')\
+                .eq('teacher_quiz_id', quiz_id)\
+                .execute()
+            
+            submitted_ids = [s['student_id'] for s in submitted.data] if submitted.data else []
+            
+            # Send reminders to pending students (excluding those reminded in last 24 hours)
+            notifications = []
+            student_names = []  # For activity log
+            skipped_count = 0
+            
+            for student in class_students.data:
+                if student['id'] not in submitted_ids:
+                    # Check if student was already reminded in the last 24 hours
+                    if was_student_reminded_recently(student['id'], quiz_id, hours=24):
+                        skipped_count += 1
+                        continue  # Skip this student - they already got a reminder today
+                    
+                    student_name = f"{student['first_name']} {student['last_name']}"
+                    student_names.append(student_name)
+                    
+                    notification = {
                         'user_id': student['id'],
                         'sender_id': teacher_id,
-                        'title': notif_title,
-                        'message': notif_message,
-                        'notif_type': 'Task',
-                        'status': 'Unread',
-                        'task_id': assigned_task_id
-                    }))
-                except (IndexError, KeyError) as e:
-                    print(f"Error sending notification to student {student['id']}: {e}")
-                    safe_execute(supabase.table('notifications').insert({
-                        'user_id': student['id'],
-                        'sender_id': teacher_id,
-                        'title': notif_title,
-                        'message': notif_message,
-                        'notif_type': 'Activities',
+                        'title': 'Quiz Reminder',
+                        'message': message or f"Please complete your quiz '{quiz_data['quiz_title']}'. It's still available for submission.",
+                        'assignment_id': assignment_id,
+                        'notif_type': 'Class Assignment',
                         'status': 'Unread'
-                    }))
+                    }
+                    notifications.append(notification)
+                    
+                    # Record the reminder
+                    record_reminder(student['id'], quiz_id, teacher_id, 'bulk', 
+                                  message or f"Please complete your quiz '{quiz_data['quiz_title']}'. It's still available for submission.")
+            
+            if notifications:
+                supabase.table('notifications').insert(notifications).execute()
+                
+                # Log the activity with ALL required fields
+                student_list = ', '.join(student_names[:5])  # First 5 students
+                if len(student_names) > 5:
+                    student_list += f" and {len(student_names) - 5} more"
+                
+                skip_info = f" ({skipped_count} already reminded today)" if skipped_count > 0 else ""
+                
+                activity_log = {
+                    'user_id': teacher_id,
+                    'user_role': teacher_role,
+                    'action': 'Sent bulk quiz reminder',
+                    'activity': 'Sent quiz reminder',
+                    'description': f'Sent reminders to {len(notifications)} students for quiz "{quiz_data["quiz_title"]}" (Grade {quiz_data["grade_level"]} - {quiz_data["section"]}){skip_info}',
+                    'details': f'Students: {student_list}'
+                }
+                supabase.table('admin_activity_log').insert(activity_log).execute()
+            
+            return jsonify({
+                'success': True,
+                'message': f'Reminders sent to {len(notifications)} students' + (f' ({skipped_count} already reminded today)' if skipped_count > 0 else ''),
+                'count': len(notifications),
+                'skipped_count': skipped_count
+            })
+            
+        else:
+            # Check if student was already reminded in the last 24 hours
+            if was_student_reminded_recently(student_id, quiz_id, hours=24):
+                return jsonify({
+                    'success': False,
+                    'error': 'This student was already reminded about this quiz in the last 24 hours. Please try again later.',
+                    'cooldown_active': True
+                }), 429  # 429 = Too Many Requests
+            
+            # Get student info for the log
+            student = supabase.table('user_info')\
+                .select('first_name, last_name')\
+                .eq('id', student_id)\
+                .execute()
+            
+            student_name = f"{student.data[0]['first_name']} {student.data[0]['last_name']}" if student.data else f"Student {student_id}"
+            
+            # Send reminder to single student
+            notification = {
+                'user_id': student_id,
+                'sender_id': teacher_id,
+                'title': 'Quiz Reminder',
+                'message': message or f"Please complete your quiz '{quiz_data['quiz_title']}'. It's still available for submission.",
+                'assignment_id': assignment_id,
+                'notif_type': 'Class Assignment',
+                'status': 'Unread'
+            }
+            
+            result = supabase.table('notifications').insert(notification).execute()
+            
+            # Record the reminder
+            record_reminder(student_id, quiz_id, teacher_id, 'single',
+                          message or f"Please complete your quiz '{quiz_data['quiz_title']}'. It's still available for submission.")
+            
+            # Log the activity with ALL required fields
+            activity_log = {
+                'user_id': teacher_id,
+                'user_role': teacher_role,
+                'action': 'Sent quiz reminder',
+                'activity': 'Sent quiz reminder',
+                'description': f'Sent reminder to student {student_name} for quiz "{quiz_data["quiz_title"]}" (Grade {quiz_data["grade_level"]} - {quiz_data["section"]})',
+                'details': f'Student ID: {student_id}, Quiz ID: {quiz_id}'
+            }
+            supabase.table('admin_activity_log').insert(activity_log).execute()
+            
+            return jsonify({
+                'success': True,
+                'message': f'Reminder sent successfully to {student_name}',
+                'notification_id': result.data[0]['notif_id'] if result.data else None
+            })
+        
+    except Exception as e:
+        logger.error(f"Error sending reminder: {e}")
+        return jsonify({'error': str(e)}), 500
 
-        return jsonify({'success': True, 'message': 'Activities assigned to classroom.'}), 200
 
-    return jsonify({'success': False, 'message': 'No students found in classroom.'}), 400
+#--TEACHER SEND GENERAL NOTIFICATION ROUTE (MOBILE VERSION) - CAN BE USED FOR QUIZ RETAKE ALLOWED AND OTHER MESSAGES
+@app.route('/api/send-notification', methods=['POST'])
+def send_notification():
+    """Send a notification to a student"""
+    try:
+        data = request.get_json()
+        # Try session first, then request body fallback
+        teacher_id = session.get('user_id') or data.get('teacher_id')
+        
+        if not teacher_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        user_id = data.get('user_id')
+        title = data.get('title')
+        message = data.get('message')
+        notif_type = data.get('notif_type', 'General Notification')
+        
+        if not all([user_id, title, message]):
+            return jsonify({'error': 'Missing required fields: user_id, title, message'}), 400
+        
+        # Create notification
+        notification = {
+            'user_id': user_id,
+            'sender_id': teacher_id,
+            'title': title,
+            'message': message,
+            'notif_type': notif_type,
+            'status': 'Unread'
+        }
+        
+        result = supabase.table('notifications').insert(notification).execute()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Notification sent successfully',
+            'notification_id': result.data[0]['notif_id'] if result.data else None
+        })
+        
+    except Exception as e:
+        logger.error(f"Error sending notification: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+#--TEACHER GET CLASS ROSTER WITH SUBMISSION STATUS ROUTE (MOBILE VERSION) - USED FOR QUIZ DETAILS AND REMINDERS
+@app.route('/api/quiz/<int:quiz_id>/class-roster', methods=['GET'])
+def get_class_roster_with_status(quiz_id):
+    """Get all students in a class with their submission status for a quiz"""
+    try:
+        teacher_id = session.get('user_id')
+        
+        if not teacher_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        # Get quiz details to know which class
+        quiz = supabase.table('teacher_quizzes')\
+            .select('grade_level, section')\
+            .eq('id', quiz_id)\
+            .execute()
+        
+        if not quiz.data:
+            return jsonify({'error': 'Quiz not found'}), 404
+            
+        quiz_data = quiz.data[0]
+        
+        # Get all students in the class
+        students = supabase.table('user_info')\
+            .select('id, first_name, last_name')\
+            .eq('role', 'Student')\
+            .eq('year_level', quiz_data['grade_level'])\
+            .eq('section', quiz_data['section'])\
+            .order('first_name')\
+            .execute()
+        
+        # Get submission status
+        submissions = supabase.table('student_quiz_results')\
+            .select('student_id, submitted_date')\
+            .eq('teacher_quiz_id', quiz_id)\
+            .execute()
+        
+        submitted_ids = {s['student_id']: s['submitted_date'] for s in (submissions.data if submissions.data else [])}
+        
+        # Combine data
+        roster = []
+        for student in students.data if students.data else []:
+            roster.append({
+                'student_id': student['id'],
+                'student_name': f"{student['first_name']} {student['last_name']}",
+                'submitted': student['id'] in submitted_ids,
+                'submitted_date': submitted_ids.get(student['id'])
+            })
+        
+        return jsonify({
+            'success': True,
+            'roster': roster,
+            'total_students': len(roster),
+            'submitted_count': len(submitted_ids),
+            'pending_count': len(roster) - len(submitted_ids)
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching class roster: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+#--TEACHER GENERATE RANDOM QUESTION ROUTE (MOBILE VERSION) - USED FOR EDIT MODE AND QUIZ CREATION
+@app.route('/api/generate-random-question', methods=['POST'])
+def generate_random_question():
+    """Generate random question based on subject and grade (for edit mode)"""
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        subject = data.get('subject', 'science').lower()
+        grade_str = data.get('grade', '7')
+        num_questions = data.get('num_questions', 1)
+        
+        try:
+            grade_int = int(grade_str)
+            if grade_int not in [7, 8, 9, 10]:
+                grade_int = 7
+        except:
+            grade_int = 7
+        
+        logger.info(f"[RANDOM_QUESTION] Generating {num_questions} question(s) for {subject} grade {grade_int}")
+        
+        # Get questions from QUIZ_DATASETS
+        grade_key = f'grade_{grade_int}'
+        
+        if subject not in QUIZ_DATASETS or grade_key not in QUIZ_DATASETS[subject]:
+            logger.warning(f"[RANDOM_QUESTION] Subject {subject} or grade {grade_key} not found")
+            return jsonify({'error': f'Subject {subject} or grade not available'}), 400
+        
+        available_questions = QUIZ_DATASETS[subject][grade_key]
+        
+        if not available_questions:
+            logger.warning(f"[RANDOM_QUESTION] No questions available for {subject} {grade_key}")
+            return jsonify({'error': 'No questions available for this subject/grade'}), 400
+        
+        # Select random questions
+        import random
+        selected_questions = []
+        num_to_select = min(num_questions, len(available_questions))
+        
+        selected_indices = random.sample(range(len(available_questions)), num_to_select)
+        for idx in selected_indices:
+            selected_questions.append(available_questions[idx])
+        
+        logger.info(f"[RANDOM_QUESTION] Generated {len(selected_questions)} question(s) successfully")
+        
+        return jsonify({
+            'success': True,
+            'quiz': selected_questions,
+            'count': len(selected_questions),
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"[RANDOM_QUESTION] Error generating random question: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+# ====================================================================================================
+#                                         TEACHER ACTIVITY AND QUIZ PAGE ROUTE END
+# ====================================================================================================
+
+
+
+
+
+
+
+
+# ====================================================================================================
+#                                        TEACHER ANALYTICS PAGE ROUTE START
+# ====================================================================================================
 
 
 # --- TEACHER ANALYTICS PAGE ROUTE (MOBILE VERSION) ---
@@ -7498,6 +11027,21 @@ def teacher_analytics():
         }), 500
 
 
+# ====================================================================================================
+#                                         TEACHER ANALYTICS PAGE ROUTE END
+# ====================================================================================================
+
+
+
+
+
+
+
+
+# ====================================================================================================
+#                                         TEACHER PROFILE PAGE ROUTE START
+# ====================================================================================================
+
 # --- TEACHER PROFILE INFO ROUTE (NEW) ---
 @app.route('/teacher_personal_info', methods=['GET'])
 def teacher_personal_info():
@@ -7594,7 +11138,7 @@ def _handle_profile_picture_upload():
     if hasattr(storage_resp, 'error') and storage_resp.error is not None:
         return jsonify({'success': False, 'message': str(storage_resp.error)}), 500
 
-    public_url = f"https://bdcmzatfoaocnsfdpudv.supabase.co/storage/v1/object/public/profile-pictures/{filename}"
+    public_url = f"https://myetrhrskmbwnmmmxdzt.supabase.co/storage/v1/object/public/profile-pictures/{filename}"
 
     # ✅ ONLY update profile_pictures (current picture)
     existing = safe_execute(supabase.table('profile_pictures').select('pic_id').eq('user_id', user_id))
@@ -7724,7 +11268,8 @@ def _handle_profile_info_update():
     except Exception as e:
         print(f"Error updating profile: {e}")
         return jsonify({'success': False, 'message': 'Server error occurred while updating profile.'}), 500
-    
+
+
 # --- TEACHER CHANGE PASSWORD ROUTE ---
 @app.route('/teacher_change_password', methods=['POST'])
 def teacher_change_password():
@@ -7808,6 +11353,12 @@ def teacher_change_password():
             'message': 'Server error occurred while changing password.'
         }), 500
 
+
+# ====================================================================================================
+#                                         TEACHER PROFILE PAGE ROUTE END
+# ====================================================================================================
+
+
 # --- SAFELY EXECUTE QUERIES WITH RETRY LOGIC ---
 def safe_execute(query, retries=3, delay=1):
     for attempt in range(retries):
@@ -7820,4 +11371,29 @@ def safe_execute(query, retries=3, delay=1):
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5001)
+    import sys
+    try:
+        print("=" * 70, flush=True)
+        print("🚀 Starting Learn2Earn Flask Server...", flush=True)
+        print("=" * 70, flush=True)
+        print(f"✅ Python Version: {sys.version}", flush=True)
+        print(f"✅ Flask App Name: {app.name}", flush=True)
+        print(f"✅ Routes Count: {len(app.url_map._rules)}", flush=True)
+        print("=" * 70, flush=True)
+        print("\n📍 Server will be running on:", flush=True)
+        print("   → http://localhost:5001", flush=True)
+        print("   → http://127.0.0.1:5001", flush=True)
+        print("   → http://172.16.39.165:5001", flush=True)
+        print("\n⏳ Waiting for requests...\n", flush=True)
+        sys.stdout.flush()
+        
+        app.run(debug=True, host='0.0.0.0', port=5001, use_reloader=False, threaded=True)
+    except KeyboardInterrupt:
+        print("\n\n⛔ Server stopped by user.", flush=True)
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ FATAL ERROR: {e}", flush=True)
+        import traceback
+        print("\n📋 Traceback:", flush=True)
+        traceback.print_exc()
+        sys.exit(1)

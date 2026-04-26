@@ -11,3 +11,5 @@ langdetect
 openpyxl
 pandas
 gunicorn
+PyPDF2
+python-docx
