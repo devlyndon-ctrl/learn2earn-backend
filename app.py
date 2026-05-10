@@ -3263,11 +3263,12 @@ def get_reward_redemptions():
 def get_leaderboard():
     """
     Get leaderboard for a specific section.
-    Query params: section (required), period (optional: 'This Week', 'This Month', 'Current Points')
+    Query params: section (required), period (optional: 'This Week', 'This Month', 'Current Points'), school_year (optional: defaults to current)
     """
     try:
         section = request.args.get('section')
         period = request.args.get('period', 'Current Points')
+        school_year = request.args.get('school_year', get_current_school_year())  # ✅ NEW: Add school_year param
 
         if not section:
             return jsonify({'error': 'Section is required'}), 400
@@ -3306,7 +3307,10 @@ def get_leaderboard():
                 })
         else:
             # Use points table for This Week, This Month
-            now = datetime.now()
+            # Use Manila timezone consistently
+            tz = timezone('Asia/Manila')
+            now = datetime.now(tz)
+            
             if period == 'This Week':
                 start = now - timedelta(days=now.weekday())
             elif period == 'This Month':
@@ -3314,16 +3318,59 @@ def get_leaderboard():
             else:
                 start = None
 
+            # ✅ PARSE SCHOOL YEAR TO GET DATE RANGE (with timezone)
+            school_year_parts = school_year.split('-')
+            if len(school_year_parts) == 2:
+                try:
+                    year_start = int(school_year_parts[0])
+                    school_year_start = datetime(year_start, 6, 1, tzinfo=tz)  # June 1st Manila time
+                    school_year_end = datetime(year_start + 1, 5, 31, 23, 59, 59, tzinfo=tz)  # May 31st Manila time
+                except ValueError:
+                    school_year_start = None
+                    school_year_end = None
+            else:
+                school_year_start = None
+                school_year_end = None
+
             for student in students:
                 user_id = student['id']
+                
+                # Build query with proper filtering
                 points_query = supabase.table('points') \
                     .select('points, received_at') \
                     .eq('student_id', user_id) \
                     .eq('status', 'approved')
+                
+                # Filter by time period (This Week/This Month) - THIS IS THE PRIMARY FILTER
                 if start:
-                    points_query = points_query.gte('received_at', start.isoformat())
+                    # Use date only for comparison (ignore time)
+                    points_query = points_query.gte('received_at', start.date().isoformat())
+                
+                # Filter by school year END date ONLY (don't override the time period start)
+                # This ensures we stay within the school year but don't break time period filters
+                if school_year_end:
+                    points_query = points_query.lte('received_at', school_year_end.date().isoformat())
+                
                 points_resp = safe_execute(points_query)
-                total_points = sum([p['points'] for p in points_resp.data]) if points_resp and getattr(points_resp, 'data', None) else 0
+                points_total = sum([p['points'] for p in points_resp.data]) if points_resp and getattr(points_resp, 'data', None) else 0
+                
+                # Also add milestone_claims points for the same period
+                milestone_query = supabase.table('milestone_claims') \
+                    .select('points_awarded, claimed_at') \
+                    .eq('student_id', user_id)
+                
+                # Filter by time period (This Week/This Month)
+                if start:
+                    milestone_query = milestone_query.gte('claimed_at', start.date().isoformat())
+                
+                # Filter by school year END date ONLY (don't override the time period start)
+                if school_year_end:
+                    milestone_query = milestone_query.lte('claimed_at', school_year_end.date().isoformat())
+                
+                milestone_resp = safe_execute(milestone_query)
+                milestone_total = sum([m['points_awarded'] for m in milestone_resp.data]) if milestone_resp and getattr(milestone_resp, 'data', None) else 0
+                
+                total_points = points_total + milestone_total
 
                 # Get latest profile picture from profile_pictures table
                 pic_resp = safe_execute(supabase.table('profile_pictures') \
@@ -3381,6 +3428,179 @@ def get_current_school_year():
         if start <= today <= end:
             return q['school_year']
     return None
+
+
+# --- GET ALL AVAILABLE SCHOOL YEARS ROUTE ---
+@app.route('/get_school_years', methods=['GET'])
+def get_school_years():
+    try:
+        print("[GET_SCHOOL_YEARS] 🔍 Fetching all school years from quarters table...")
+        resp = safe_execute(
+            supabase.table('quarters')
+            .select('school_year')
+            .order('school_year', desc=True)
+        )
+        
+        print(f"[GET_SCHOOL_YEARS] Response data: {resp.data if resp and hasattr(resp, 'data') else 'None'}")
+        
+        if not resp or not resp.data:
+            print("[GET_SCHOOL_YEARS] ⚠️ No data returned from quarters table")
+            return jsonify({'school_years': []}), 200
+        
+        # Get unique school years and sort them
+        school_years = sorted(list(set([q['school_year'] for q in resp.data if q.get('school_year')])), reverse=True)
+        
+        print(f"[GET_SCHOOL_YEARS] ✅ Found school years: {school_years}")
+        return jsonify({'school_years': school_years}), 200
+    except Exception as e:
+        print(f"[GET_SCHOOL_YEARS] ❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'school_years': []}), 500
+
+
+# --- GET SCHOOL YEAR INFO (STATUS, DAYS LEFT, FINISHED) ROUTE ---
+@app.route('/get_school_year_info', methods=['GET'])
+def get_school_year_info():
+    """
+    Get info about a school year (is it current, days remaining, finished status, current quarter)
+    Query params: school_year (e.g., "2026-2027")
+    """
+    try:
+        school_year = request.args.get('school_year')
+        if not school_year:
+            return jsonify({'error': 'school_year parameter required'}), 400
+        
+        print(f"[SCHOOL_YEAR_INFO] 🔍 Getting info for school year: {school_year}")
+        
+        # Get all quarters for this school year
+        resp = safe_execute(
+            supabase.table('quarters')
+            .select('quarter_name, start_date, end_date')
+            .eq('school_year', school_year)
+            .order('end_date', desc=False)
+        )
+        
+        if not resp or not resp.data:
+            print(f"[SCHOOL_YEAR_INFO] ⚠️ No quarters found for {school_year}")
+            return jsonify({'error': f'No data for {school_year}'}), 404
+        
+        today = datetime.now().date()
+        quarters_data = resp.data
+        
+        # Find earliest and latest quarter dates for this school year
+        earliest_start_date = None
+        latest_end_date = None
+        for q in quarters_data:
+            start = parser.parse(q['start_date']).date()
+            end = parser.parse(q['end_date']).date()
+            if earliest_start_date is None or start < earliest_start_date:
+                earliest_start_date = start
+            if latest_end_date is None or end > latest_end_date:
+                latest_end_date = end
+        
+        # Find current quarter (if any)
+        current_quarter = None
+        for q in quarters_data:
+            start = parser.parse(q['start_date']).date()
+            end = parser.parse(q['end_date']).date()
+            if start <= today <= end:
+                current_quarter = q['quarter_name']
+                break
+        
+        # Determine if school year is current or finished
+        # is_current: today falls within the school year date range (June to May)
+        # is_finished: today is after the last quarter end date
+        is_finished = today > latest_end_date
+        is_current = earliest_start_date <= today <= latest_end_date and not is_finished
+        
+        # Calculate days remaining
+        days_remaining = 0
+        if not is_finished:
+            days_remaining = (latest_end_date - today).days
+        
+        print(f"[SCHOOL_YEAR_INFO] ✅ school_year={school_year}, is_current={is_current}, is_finished={is_finished}, days_remaining={days_remaining}, current_quarter={current_quarter}")
+        
+        return jsonify({
+            'school_year': school_year,
+            'is_current': is_current,
+            'is_finished': is_finished,
+            'days_remaining': max(0, days_remaining),
+            'current_quarter': current_quarter,
+            'end_date': latest_end_date.isoformat() if latest_end_date else None,
+            'status': 'Finished' if is_finished else ('Active' if is_current else 'Upcoming')
+        }), 200
+    except Exception as e:
+        print(f"[SCHOOL_YEAR_INFO] ❌ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+# --- GET QUARTERS WITH STATUS INFO ROUTE ---
+@app.route('/get_quarters_with_status', methods=['GET'])
+def get_quarters_with_status():
+    """
+    Get all quarters with their status (Active, Finished, or days away)
+    Optional query param: school_year (e.g., "2026-2027")
+    """
+    try:
+        school_year = request.args.get('school_year')
+        
+        # Build query
+        if school_year:
+            resp = safe_execute(
+                supabase.table('quarters')
+                .select('quarter_name, start_date, end_date, school_year')
+                .eq('school_year', school_year)
+                .order('start_date', desc=False)
+            )
+        else:
+            resp = safe_execute(
+                supabase.table('quarters')
+                .select('quarter_name, start_date, end_date, school_year')
+                .order('start_date', desc=False)
+            )
+        
+        if not resp or not resp.data:
+            return jsonify({'error': 'No quarters found'}), 404
+        
+        today = datetime.now().date()
+        quarters_info = []
+        
+        for q in resp.data:
+            start = parser.parse(q['start_date']).date()
+            end = parser.parse(q['end_date']).date()
+            
+            # Determine status
+            if today < start:
+                days_away = (start - today).days
+                status = f"{days_away} days away"
+                is_active = False
+            elif start <= today <= end:
+                status = "Active"
+                is_active = True
+            else:
+                status = "Finished"
+                is_active = False
+            
+            quarters_info.append({
+                'quarter_name': q['quarter_name'],
+                'start_date': q['start_date'],
+                'end_date': q['end_date'],
+                'school_year': q['school_year'],
+                'status': status,
+                'is_active': is_active,
+                'display_text': f"{q['quarter_name']} ({status})"
+            })
+        
+        print(f"[QUARTERS_STATUS] Found {len(quarters_info)} quarters")
+        return jsonify({'quarters': quarters_info}), 200
+    except Exception as e:
+        print(f"[QUARTERS_STATUS] Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 
 # --- GET CURRENT QUARTER LEADERBOARD BY SECTION ROUTE ---
@@ -3615,6 +3835,7 @@ def activities_completed():
 @app.route('/weekly_points', methods=['GET'])
 def weekly_points():
     user_id = request.args.get('user_id')
+    school_year = request.args.get('school_year', get_current_school_year())  # ✅ NEW: Add school_year param
     if not user_id:
         return jsonify({'error': 'Missing user_id'}), 400
 
@@ -3625,15 +3846,31 @@ def weekly_points():
     days = [(start_of_week + timedelta(days=i)).date() for i in range(7)]
     points_per_day = [0] * 7
 
+    # ✅ PARSE SCHOOL YEAR TO GET DATE RANGE (with timezone)
+    school_year_parts = school_year.split('-')
+    if len(school_year_parts) == 2:
+        try:
+            year_start = int(school_year_parts[0])
+            school_year_start = datetime(year_start, 6, 1, tzinfo=tz)  # June 1st Manila time
+            school_year_end = datetime(year_start + 1, 5, 31, 23, 59, 59, tzinfo=tz)  # May 31st Manila time
+        except ValueError:
+            school_year_start = None
+            school_year_end = None
+    else:
+        school_year_start = None
+        school_year_end = None
+
     # 1. Points from 'points' table (all approved points)
-    points_resp = safe_execute(
-        supabase.table('points')
-        .select('points, received_at')
-        .eq('student_id', user_id)
-        .eq('status', 'approved')
-        .gte('received_at', start_of_week.date().isoformat())
+    points_query = supabase.table('points') \
+        .select('points, received_at') \
+        .eq('student_id', user_id) \
+        .eq('status', 'approved') \
+        .gte('received_at', start_of_week.date().isoformat()) \
         .lte('received_at', end_of_week.date().isoformat())
-    )
+    # ✅ FILTER BY SCHOOL YEAR (END DATE ONLY - don't override week filter)
+    if school_year_end:
+        points_query = points_query.lte('received_at', school_year_end.date().isoformat())
+    points_resp = safe_execute(points_query)
     if points_resp.data:
         for p in points_resp.data:
             date_str = p['received_at']
@@ -3648,13 +3885,15 @@ def weekly_points():
                 continue
 
     # 2. Points from 'milestone_claims' table (points_awarded per day)
-    milestone_resp = safe_execute(
-        supabase.table('milestone_claims')
-        .select('points_awarded, claimed_at')
-        .eq('student_id', user_id)
-        .gte('claimed_at', start_of_week.date().isoformat())
+    milestone_query = supabase.table('milestone_claims') \
+        .select('points_awarded, claimed_at') \
+        .eq('student_id', user_id) \
+        .gte('claimed_at', start_of_week.date().isoformat()) \
         .lte('claimed_at', end_of_week.date().isoformat())
-    )
+    # ✅ FILTER BY SCHOOL YEAR (END DATE ONLY)
+    if school_year_end:
+        milestone_query = milestone_query.lte('claimed_at', school_year_end.date().isoformat())
+    milestone_resp = safe_execute(milestone_query)
     if milestone_resp.data:
         for m in milestone_resp.data:
             date_str = m.get('claimed_at', '')
@@ -4179,7 +4418,7 @@ def get_notifications():
         # JOIN task_assignments to get the status of the task for each notification (if notif_type == 'Task')
         resp = safe_execute(
             supabase.table('notifications')
-            .select('notif_id, user_id, sender_id, title, message, reward_id, redemption_id, point_id, task_id, assignment_id, history_id, notif_type, status, created_at, task_assignments(status)')
+            .select('notif_id, user_id, sender_id, title, message, reward_id, redemption_id, point_id, task_id, assignment_id, history_id, notif_type, status, created_at, quiz_id, task_assignments(status)')
             .eq('user_id', user_id)
             .order('created_at', desc=True)
             .limit(30)
@@ -8765,7 +9004,15 @@ def create_activity():
                 })
             if assignments:
                 result = safe_execute(supabase.table('task_assignments').insert(assignments))
-                task_ids = [r.get('task_id') for r in result.data] if result.data else []
+                
+                # ✅ FIXED: Get assignment_id directly from task_assignments table response
+                student_to_assignment = {}
+                if result.data:
+                    for i, assignment in enumerate(result.data):
+                        assignment_id = assignment.get('assignment_id')  # Get directly from table
+                        student_id = assignment.get('student_id')
+                        if assignment_id and student_id:
+                            student_to_assignment[student_id] = assignment_id
                 
                 # Send notifications to all students
                 student_ids = [s['id'] for s in students]
@@ -8786,19 +9033,32 @@ def create_activity():
                     prefix = 'Mx.'
                 teacher_name = f"{prefix} {teacher_last_name}"
                 
-                notifications = []
-                for student_id in student_ids:
-                    notifications.append({
-                        'user_id': student_id,
-                        'sender_id': teacher_id,
-                        'title': 'New Activity',
-                        'message': f"{teacher_name} assigned a new activity: {task}",
-                        'notif_type': 'Task',
-                        'status': 'Unread',
-                    })
-                
-                if notifications:
-                    safe_execute(supabase.table('notifications').insert(notifications))
+                # ✅ INSERT NOTIFICATIONS ONE-BY-ONE WITH DELAYS to avoid timestamp collision
+                try:
+                    import time
+                    logger.info(f"📢 Attempting to create notifications for {len(student_ids)} students...")
+                    for student_id in student_ids:
+                        assignment_id = student_to_assignment.get(student_id)
+                        logger.info(f"   Student {student_id}: assignment_id = {assignment_id}")
+                        if assignment_id:
+                            try:
+                                notif_data = {
+                                    'user_id': student_id,
+                                    'sender_id': teacher_id,
+                                    'title': 'New Activity',
+                                    'message': f"{teacher_name} assigned a new activity: {task}",
+                                    'notif_type': 'Task',
+                                    'status': 'Unread',
+                                    'assignment_id': assignment_id,
+                                }
+                                logger.info(f"   Inserting notification: {notif_data}")
+                                result = safe_execute(supabase.table('notifications').insert(notif_data))
+                                logger.info(f"   ✅ Notification inserted for student {student_id}")
+                                time.sleep(0.1)  # 100ms delay to ensure different timestamps
+                            except Exception as single_notif_error:
+                                logger.error(f"❌ Failed to create notification for student {student_id}: {str(single_notif_error)}", exc_info=True)
+                except Exception as notif_error:
+                    logger.error(f"❌ Notification creation loop failed for activity {activity_group_id}: {str(notif_error)}", exc_info=True)
                 
                 # Log activity to admin_activity_log
                 safe_execute(
@@ -8812,11 +9072,14 @@ def create_activity():
                     })
                 )
                 
+                # Build assignment IDs list for response
+                assignment_ids = [assignment.get('id') for assignment in (result.data if result.data else [])]
+                
                 return jsonify({
                     'success': True,
                     'message': 'Activity created',
                     'activity_group_id': activity_group_id,
-                    'task_ids': task_ids,
+                    'assignment_ids': assignment_ids,
                     'file_urls': [],
                 }), 200
             else:
@@ -8890,7 +9153,15 @@ def create_activity():
 
         if assignments:
             result = safe_execute(supabase.table('task_assignments').insert(assignments))
-            task_ids = [r.get('task_id') for r in result.data] if result.data else []
+            
+            # ✅ FIXED: Get assignment_id directly from task_assignments table response
+            student_to_assignment = {}
+            if result.data:
+                for assignment in result.data:
+                    assignment_id = assignment.get('assignment_id')  # Get directly from table
+                    student_id = assignment.get('student_id')
+                    if assignment_id and student_id:
+                        student_to_assignment[student_id] = assignment_id
             
             # Send notifications to all students
             student_ids = [s['id'] for s in students]
@@ -8911,19 +9182,32 @@ def create_activity():
                 prefix = 'Mx.'
             teacher_name = f"{prefix} {teacher_last_name}"
             
-            notifications = []
-            for student_id in student_ids:
-                notifications.append({
-                    'user_id': student_id,
-                    'sender_id': teacher_id,
-                    'title': 'New Activity',
-                    'message': f"{teacher_name} assigned a new activity: {task}",
-                    'notif_type': 'Task',
-                    'status': 'Unread',
-                })
-            
-            if notifications:
-                safe_execute(supabase.table('notifications').insert(notifications))
+            # ✅ INSERT NOTIFICATIONS ONE-BY-ONE WITH DELAYS to avoid timestamp collision
+            try:
+                import time
+                logger.info(f"📢 Attempting to create notifications for {len(student_ids)} students...")
+                for student_id in student_ids:
+                    assignment_id = student_to_assignment.get(student_id)
+                    logger.info(f"   Student {student_id}: assignment_id = {assignment_id}")
+                    if assignment_id:
+                        try:
+                            notif_data = {
+                                'user_id': student_id,
+                                'sender_id': teacher_id,
+                                'title': 'New Activity',
+                                'message': f"{teacher_name} assigned a new activity: {task}",
+                                'notif_type': 'Task',
+                                'status': 'Unread',
+                                'assignment_id': assignment_id,
+                            }
+                            logger.info(f"   Inserting notification: {notif_data}")
+                            result = safe_execute(supabase.table('notifications').insert(notif_data))
+                            logger.info(f"   ✅ Notification inserted for student {student_id}")
+                            time.sleep(0.1)  # 100ms delay between inserts to ensure different timestamps
+                        except Exception as single_notif_error:
+                            logger.error(f"❌ Failed to create notification for student {student_id}: {str(single_notif_error)}", exc_info=True)
+            except Exception as notif_error:
+                logger.error(f"❌ Notification creation loop failed for activity {activity_group_id}: {str(notif_error)}", exc_info=True)
             
             # Log activity to admin_activity_log
             safe_execute(
@@ -8937,11 +9221,14 @@ def create_activity():
                 })
             )
             
+            # Build assignment IDs list for response
+            assignment_ids = [assignment.get('id') for assignment in (result.data if result.data else [])]
+            
             return jsonify({
                 'success': True,
                 'message': 'Activity created sabay-sabay with files',
                 'activity_group_id': activity_group_id,
-                'task_ids': task_ids,
+                'assignment_ids': assignment_ids,
                 'file_urls': uploaded_file_urls,
             }), 200
         else:
@@ -9748,49 +10035,45 @@ def create_teacher_quiz():
             except Exception as ve:
                 logger.error(f"[CREATE_QUIZ] ❌ Verification failed: {ve}")
             
-            # ✅ ADD ENTRIES TO NOTIFICATIONS TABLE FOR STUDENTS
+            # ✅ ADD ENTRIES TO NOTIFICATIONS TABLE FOR STUDENTS (one-by-one with delays)
             try:
+                import time
                 # Get all students in this grade/section
                 students_resp = safe_execute(
-                    supabase.table('task_assignments')\
-                    .select('student_id, user_info!task_assignments_student_id_fkey(first_name, last_name)')\
-                    .eq('grade_level', data.get('grade_level'))\
+                    supabase.table('user_info')\
+                    .select('id, first_name, last_name')\
+                    .eq('role', 'Student')\
+                    .eq('year_level', data.get('grade_level'))\
                     .eq('section', data.get('section'))
                 )
                 
                 if students_resp.data:
+                    logger.info(f"📢 Attempting to create quiz notifications for {len(students_resp.data)} students...")
                     for student_record in students_resp.data:
-                        student_id = student_record.get('student_id')
-                        student_info = student_record.get('user_info')
-                        if student_info:
-                            student_name = f"{student_info.get('first_name', '')} {student_info.get('last_name', '')}"
-                        else:
-                            student_name = f"Student {student_id}"
+                        student_id = student_record.get('id')
+                        student_name = f"{student_record.get('first_name', '')} {student_record.get('last_name', '')}"
                         
-                        # Check if notification already exists for this quiz
-                        existing_notif = safe_execute(
-                            supabase.table('notifications')\
-                            .select('notif_id')\
-                            .eq('user_id', student_id)\
-                            .eq('sender_id', teacher_id)\
-                            .ilike('message', f'%{quiz_record["quiz_title"]}%')
-                        )
-                        
-                        if not existing_notif.data:
-                            # Create notification for this student only if it doesn't exist
+                        try:
+                            # ✅ FIXED: Store quiz ID in quiz_id column (dedicated column exists)
                             notification = {
                                 'user_id': student_id,
                                 'sender_id': teacher_id,
                                 'title': 'New Quiz Available',
                                 'message': f"Teacher {teacher_name} assigned a new quiz: {quiz_record['quiz_title']} - Due: {due_date_display}",
                                 'notif_type': 'Quiz',
-                                'status': 'Unread'
+                                'status': 'Unread',
+                                'quiz_id': quiz_id  # ✅ Store quiz ID in quiz_id column
                             }
+                            logger.info(f"   Student {student_id} ({student_name}): inserting quiz notification with quiz_id={quiz_id}...")
                             safe_execute(supabase.table('notifications').insert(notification))
+                            logger.info(f"   ✅ Quiz notification inserted for {student_name}")
+                            time.sleep(0.1)  # 100ms delay to ensure different timestamps
+                        except Exception as single_notif_error:
+                            logger.error(f"❌ Failed to create quiz notification for student {student_id}: {str(single_notif_error)}", exc_info=True)
                     
-                    logger.info(f"[CREATE_QUIZ] Created notifications for {len(students_resp.data)} students")
+                    logger.info(f"[CREATE_QUIZ] ✅ Completed notifications for {len(students_resp.data)} students")
             except Exception as e:
-                logger.warning(f"[CREATE_QUIZ] Error creating notifications: {e}")
+                logger.error(f"[CREATE_QUIZ] ❌ Error creating quiz notifications: {e}", exc_info=True)
             
             return jsonify({
                 'success': True,
@@ -10184,6 +10467,185 @@ def get_class_results():
         logger.error(f"Error fetching class results: {e}")
         return jsonify({'error': str(e)}), 500
 
+
+
+
+
+
+#✅ TEACHER GET CLASS ROSTER WITH QUIZ STATUS ROUTE (MOBILE VERSION) - INCLUDES NON-SUBMITTED STUDENTS
+@app.route('/api/teacher/class-roster-with-quiz', methods=['GET'])
+def get_class_roster_with_quiz():
+    """Get all students in a class with their quiz submission status (including non-submitted)"""
+    try:
+        teacher_id = session.get('user_id') or request.args.get('teacher_id')
+        quiz_id = request.args.get('quiz_id')
+        
+        if not teacher_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        if not quiz_id:
+            return jsonify({'error': 'quiz_id is required'}), 400
+        
+        logger.info(f"🔍 get_class_roster_with_quiz called with teacher_id={teacher_id}, quiz_id={quiz_id}")
+        
+        # Step 1: Get the quiz to find grade_level and section it's assigned to
+        quiz_response = supabase.table('teacher_quizzes').select('*')\
+            .eq('id', quiz_id)\
+            .eq('teacher_id', teacher_id)\
+            .execute()
+        
+        logger.info(f"📚 Quiz query response: {quiz_response.data}")
+        
+        if not quiz_response.data:
+            logger.error(f"❌ Quiz not found for quiz_id={quiz_id}, teacher_id={teacher_id}")
+            return jsonify({'error': 'Quiz not found or not authorized'}), 404
+        
+        quiz = quiz_response.data[0]
+        grade_level = quiz.get('grade_level')
+        section = quiz.get('section')
+        quiz_title = quiz.get('quiz_title', 'N/A')
+        total_items = quiz.get('total_items', 0)
+        
+        logger.info(f"✅ Found quiz: {quiz_title}, grade_level={grade_level}, section={section}")
+        
+        # Step 2: Get all ACTIVE students in this grade/section from user_info table
+        students_response = supabase.table('user_info').select('id, first_name, last_name, year_level, section')\
+            .eq('year_level', grade_level)\
+            .eq('section', section)\
+            .eq('status', 'Active')\
+            .execute()
+        
+        students_data = students_response.data if students_response.data else []
+        logger.info(f"👥 Active students found for grade {grade_level}, section {section}: {len(students_data)}")
+        
+        if not students_data:
+            logger.warning(f"⚠️ No students found for grade={grade_level}, section={section}")
+            return jsonify({'success': True, 'results': []})
+        
+        # Step 3: Get submission results for this quiz
+        results_response = supabase.table('student_quiz_results').select('*')\
+            .eq('teacher_quiz_id', quiz_id)\
+            .execute()
+        
+        logger.info(f"📊 Quiz submissions found: {len(results_response.data) if results_response.data else 0}")
+        
+        # Create a map of results by student_id for quick lookup
+        results_map = {}
+        if results_response.data:
+            for result in results_response.data:
+                student_id = result.get('student_id')
+                if student_id:
+                    results_map[student_id] = result
+        
+        # Step 4: Merge student data with results (all students, submitted + pending)
+        merged_results = []
+        for student in students_data:
+            student_id = student.get('id')
+            result = results_map.get(student_id)
+            
+            # Format time spent
+            time_spent = result.get('time_spent', 0) if result else 0
+            time_spent_str = f"{time_spent} min" if isinstance(time_spent, int) else str(time_spent)
+            
+            student_record = {
+                'student_id': student_id,
+                'student_name': f"{student.get('first_name', '')} {student.get('last_name', '')}".strip(),
+                'grade_level': grade_level,
+                'section': section,
+                'score': result.get('score', 0) if result else 0,
+                'total_items': total_items,
+                'time_spent': time_spent_str,
+                'submitted_date': result.get('submitted_date', None) if result else None,
+                'quiz_title': quiz_title,
+                'quiz_id': quiz_id,
+                'is_submitted': result is not None,
+            }
+            merged_results.append(student_record)
+        
+        logger.info(f"✅ Merged results: {len(merged_results)} total students")
+        logger.info(f"   Response: {merged_results[:2] if merged_results else '[]'}...")  # Log first 2 for debugging
+        
+        return jsonify({
+            'success': True,
+            'results': merged_results
+        })
+        
+    except Exception as e:
+        logger.error(f"Error fetching class roster with quiz: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+#✅ DEBUG ENDPOINT - Check what students exist in database for a quiz
+@app.route('/api/debug/quiz-students/<int:quiz_id>', methods=['GET'])
+def debug_quiz_students(quiz_id):
+    """Debug endpoint to see what students exist for a quiz"""
+    try:
+        teacher_id = session.get('user_id') or request.args.get('teacher_id')
+        
+        if not teacher_id:
+            return jsonify({'error': 'Not authenticated'}), 401
+        
+        # Get the quiz
+        quiz_response = supabase.table('teacher_quizzes').select('*')\
+            .eq('id', quiz_id)\
+            .eq('teacher_id', teacher_id)\
+            .execute()
+        
+        if not quiz_response.data:
+            return jsonify({'error': 'Quiz not found'}), 404
+        
+        quiz = quiz_response.data[0]
+        grade_level = quiz.get('grade_level')
+        section = quiz.get('section')
+        
+        logger.info(f"🔍 DEBUG: Looking for students with grade_level={grade_level}, section={section}")
+        
+        # Get ALL students in this grade/section
+        students_response = supabase.table('user_info').select('id, first_name, last_name, year_level, section, role')\
+            .eq('year_level', grade_level)\
+            .eq('section', section)\
+            .eq('role', 'student')\
+            .execute()
+        
+        # ALSO get ALL students in this section to see if section name is different
+        all_section_students = supabase.table('user_info').select('id, first_name, last_name, year_level, section, role')\
+            .eq('section', section)\
+            .eq('role', 'student')\
+            .execute()
+        
+        # Get ALL students in this grade
+        all_grade_students = supabase.table('user_info').select('id, first_name, last_name, year_level, section, role')\
+            .eq('year_level', grade_level)\
+            .eq('role', 'student')\
+            .execute()
+        
+        return jsonify({
+            'quiz': {
+                'id': quiz_id,
+                'title': quiz.get('quiz_title'),
+                'grade_level': grade_level,
+                'section': section,
+            },
+            'students_matching_grade_and_section': [
+                {'id': s['id'], 'name': f"{s['first_name']} {s['last_name']}", 'year_level': s['year_level'], 'section': s['section']}
+                for s in (students_response.data or [])
+            ],
+            'count_matching': len(students_response.data) if students_response.data else 0,
+            'students_in_section': [
+                {'id': s['id'], 'name': f"{s['first_name']} {s['last_name']}", 'year_level': s['year_level'], 'section': s['section']}
+                for s in (all_section_students.data or [])
+            ],
+            'count_in_section': len(all_section_students.data) if all_section_students.data else 0,
+            'students_in_grade': [
+                {'id': s['id'], 'name': f"{s['first_name']} {s['last_name']}", 'year_level': s['year_level'], 'section': s['section']}
+                for s in (all_grade_students.data or [])
+            ],
+            'count_in_grade': len(all_grade_students.data) if all_grade_students.data else 0,
+        })
+        
+    except Exception as e:
+        logger.error(f"Debug error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 #✅ TEACHER GET STUDENT PERFORMANCE ROUTE (MOBILE VERSION)
@@ -10637,7 +11099,7 @@ def send_quiz_reminder():
 #--TEACHER SEND GENERAL NOTIFICATION ROUTE (MOBILE VERSION) - CAN BE USED FOR QUIZ RETAKE ALLOWED AND OTHER MESSAGES
 @app.route('/api/send-notification', methods=['POST'])
 def send_notification():
-    """Send a notification to a student"""
+    """Send a notification to a student and optionally mark retake as allowed"""
     try:
         data = request.get_json()
         # Try session first, then request body fallback
@@ -10649,10 +11111,41 @@ def send_notification():
         user_id = data.get('user_id')
         title = data.get('title')
         message = data.get('message')
-        notif_type = data.get('notif_type', 'General Notification')
+        notif_type = data.get('notif_type', 'General')
+        quiz_id = data.get('quiz_id')  # Optional: for marking retake as allowed
         
         if not all([user_id, title, message]):
             return jsonify({'error': 'Missing required fields: user_id, title, message'}), 400
+        
+        # Map notif_type to valid values (handle common variations)
+        notif_type_map = {
+            'quiz notification': 'Quiz',
+            'quiz retake allowed': 'Quiz',
+            'activity': 'Activity',
+            'reward': 'Reward',
+            'announcement': 'Announcement',
+            'general': 'General',
+            'quiz': 'Quiz',
+        }
+        
+        # Normalize to valid value
+        normalized_type = notif_type_map.get(notif_type.lower(), 'General')
+        
+        # If this is a retake allowed notification, update the student's first attempt record
+        if quiz_id and normalized_type == 'Quiz' and 'retake' in title.lower():
+            try:
+                # Find and update student's first attempt for this quiz
+                update_result = supabase.table('student_quiz_results').update(
+                    {'retake': True}
+                ).eq('teacher_quiz_id', quiz_id).eq('student_id', user_id).eq('attempt_number', 1).execute()
+                
+                if update_result.data:
+                    logger.info(f"✅ Marked retake allowed for student {user_id} on quiz {quiz_id}")
+                else:
+                    logger.warning(f"⚠️ Could not find first attempt to mark retake for student {user_id}, quiz {quiz_id}")
+            except Exception as e:
+                logger.error(f"❌ Error updating retake status: {str(e)}")
+                # Continue to send notification anyway
         
         # Create notification
         notification = {
@@ -10660,10 +11153,11 @@ def send_notification():
             'sender_id': teacher_id,
             'title': title,
             'message': message,
-            'notif_type': notif_type,
+            'notif_type': normalized_type,
             'status': 'Unread'
         }
         
+        logger.info(f"📢 Sending notification: type={normalized_type}, user={user_id}, title={title[:50]}...")
         result = supabase.table('notifications').insert(notification).execute()
         
         return jsonify({
@@ -10673,69 +11167,10 @@ def send_notification():
         })
         
     except Exception as e:
-        logger.error(f"Error sending notification: {e}")
+        logger.error(f"❌ Error sending notification: {e}")
         return jsonify({'error': str(e)}), 500
 
 
-#--TEACHER GET CLASS ROSTER WITH SUBMISSION STATUS ROUTE (MOBILE VERSION) - USED FOR QUIZ DETAILS AND REMINDERS
-@app.route('/api/quiz/<int:quiz_id>/class-roster', methods=['GET'])
-def get_class_roster_with_status(quiz_id):
-    """Get all students in a class with their submission status for a quiz"""
-    try:
-        teacher_id = session.get('user_id')
-        
-        if not teacher_id:
-            return jsonify({'error': 'Not authenticated'}), 401
-        
-        # Get quiz details to know which class
-        quiz = supabase.table('teacher_quizzes')\
-            .select('grade_level, section')\
-            .eq('id', quiz_id)\
-            .execute()
-        
-        if not quiz.data:
-            return jsonify({'error': 'Quiz not found'}), 404
-            
-        quiz_data = quiz.data[0]
-        
-        # Get all students in the class
-        students = supabase.table('user_info')\
-            .select('id, first_name, last_name')\
-            .eq('role', 'Student')\
-            .eq('year_level', quiz_data['grade_level'])\
-            .eq('section', quiz_data['section'])\
-            .order('first_name')\
-            .execute()
-        
-        # Get submission status
-        submissions = supabase.table('student_quiz_results')\
-            .select('student_id, submitted_date')\
-            .eq('teacher_quiz_id', quiz_id)\
-            .execute()
-        
-        submitted_ids = {s['student_id']: s['submitted_date'] for s in (submissions.data if submissions.data else [])}
-        
-        # Combine data
-        roster = []
-        for student in students.data if students.data else []:
-            roster.append({
-                'student_id': student['id'],
-                'student_name': f"{student['first_name']} {student['last_name']}",
-                'submitted': student['id'] in submitted_ids,
-                'submitted_date': submitted_ids.get(student['id'])
-            })
-        
-        return jsonify({
-            'success': True,
-            'roster': roster,
-            'total_students': len(roster),
-            'submitted_count': len(submitted_ids),
-            'pending_count': len(roster) - len(submitted_ids)
-        })
-        
-    except Exception as e:
-        logger.error(f"Error fetching class roster: {e}")
-        return jsonify({'error': str(e)}), 500
 
 
 #--TEACHER GENERATE RANDOM QUESTION ROUTE (MOBILE VERSION) - USED FOR EDIT MODE AND QUIZ CREATION
